@@ -300,7 +300,7 @@ def kernel(input_ptr, output_ptr, ...):
 # 解析结果：指针参数 = input_ptr, output_ptr
 ```
 
-### step2.尝试自动autotune
+#### step1.5.判断使用什么autotune
 一般同时满足下面几条时，自动autotune的成功率比较高：
 
 * split 参数能从 `tl.program_id` 路径判断出来；
@@ -310,8 +310,7 @@ def kernel(input_ptr, output_ptr, ...):
     * `offs < min(block_end, n)`
 * `key` 能和运行时 shape 参数一一对应；
 
-下面这些情况，自动autotune可能会出现解析失败的情况：
-
+此时应当跳转到step2.尝试自动autotune执行。出现下面的情况，自动autotune可能会出现解析失败的情况：
 * 没有和轴长度直接绑定的 mask/bounds
 * 某个参数必须覆盖完整语义维度
     * 例如 `BLOCK_SIZE >= hidden_dim`
@@ -319,7 +318,17 @@ def kernel(input_ptr, output_ptr, ...):
 * 一个参数同时影响两个轴，或者同时影响“核数 + tile 形状”
 * kernel 没暴露出可调 `tl.constexpr`
 
-自动autotune模板如下：
+如果step2.尝试自动autotune失败，并且满足以下条件：
+
+* 能判断哪个参数属于 `split`，哪个属于 `tiling`；
+* 知道每个参数对应轴的长度参数；
+
+此时应当跳转到step3.尝试半自动autotune
+
+否则，请直接尝试step4.尝试自定义autotune
+
+### step2.尝试自动autotune
+自动autotune完全由编译器决定尝试哪些参数组合，仅需要指定`key`。自动autotune模板如下：
 ```python
 @triton.autotune(
     # configs 为空列表，表示不传入自定义配置
@@ -342,10 +351,7 @@ def kernel(
 ```
 
 ### step3.尝试半自动autotune
-`hints` 是 Triton-Ascend 在 `autotune` 装饰器中新增的一个参数，类型为 `dict`，用于给 Triton-Ascend autotune 提供该 triton kernel 的一些关键信息，帮助 autotune 更好的生成 tiling 配置。推荐显式传 `hints` 的场景：
-
-* 能判断哪个参数属于 `split`，哪个属于 `tiling`；
-* 知道每个参数对应轴的长度参数；
+`hints` 是 Triton-Ascend 在 `autotune` 装饰器中新增的一个参数，类型为 `dict`，用于给 Triton-Ascend autotune 提供该 triton kernel 的一些关键信息，帮助 autotune 更好的生成 tiling 配置。
 
 hints 参数说明:
 * 当前 `hints` 参数中可以识别的字段有：
