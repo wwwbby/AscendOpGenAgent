@@ -22,6 +22,7 @@
   - 纯 vector 算子不可以超过 vector 单元数量
   - 既包含矩阵计算及 vector 计算的 mix 算子禁止超过 cube 核数
 - [ ] 在任务数量超过核数时，确保获取了正确的核数，且所有核都被用上了
+- [ ] 禁止使用多维 grid，仅允许使用一维 grid
 
 获取核心数量的方法：
 ```python
@@ -40,6 +41,9 @@ num_vectorcore = device_properties.get("num_vectorcore", -1)
 
 ### 6. Task 任务划分规范
 - [ ] task 任务划分禁止使用交织划分，每个 grid 任务处理的数据尽可能连续
+
+### 7. 控制流规范
+- [ ] 禁止在 triton 代码中使用 `continue` 和 `break` 语句
 
 ## 检查流程
 
