@@ -381,9 +381,9 @@ while opt_iteration < max_opt_iterations:
   - GPU 参考延迟
   - Ascend Triton 延迟
   - Ascend/GPU 倍数
-- 性能数据：加速比、延迟
+- 性能数据：加速比（保留 4 位小数）、延迟
 - 性能明细：读取 `output/perf_result.json` 中的 `per_shape_results`（如 `total_cases == 1`，则显示单条记录；多 shape 时显示多行），
-  以 Markdown 表格形式输出各 shape 的 framework 延迟、implementation 延迟和 speedup。
+  以 Markdown 表格形式输出各 shape 的 framework 延迟、implementation 延迟和 speedup（保留 4 位小数）。
 - 代码路径：`{op_name}_generated.py`
 
 **写入 `{工作目录}/summary.json`**：
