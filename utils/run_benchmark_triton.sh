@@ -235,15 +235,16 @@ if [[ "$USE_PARALLEL" == true ]]; then
                         STATUS="fail"
                     fi
 
-                    # 串行重命名思维轨迹文件
+                    # 串行重命名思维轨迹文件（带时间戳防止同名覆盖）
                     {
                         flock -x 201
                         LATEST_JSONL=$(ls -t "$CLAUDE_PROJECT_DIR"/*.jsonl 2>/dev/null | head -1)
                         if [[ -n "$LATEST_JSONL" && -f "$LATEST_JSONL" ]]; then
                             BASENAME=$(basename "$LATEST_JSONL" .jsonl)
-                            mv "$LATEST_JSONL" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}.jsonl"
+                            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+                            mv "$LATEST_JSONL" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}_${TIMESTAMP}.jsonl"
                             if [[ -d "${CLAUDE_PROJECT_DIR}/${BASENAME}" ]]; then
-                                mv "${CLAUDE_PROJECT_DIR}/${BASENAME}" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}"
+                                mv "${CLAUDE_PROJECT_DIR}/${BASENAME}" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}_${TIMESTAMP}"
                             fi
                         fi
                     } 201>"${OUTPUT_DIR}/.trace_lock"
@@ -306,13 +307,14 @@ else
             STATUS="fail"
         fi
 
-        # 重命名思维轨迹文件
+        # 重命名思维轨迹文件（带时间戳防止同名覆盖）
         LATEST_JSONL=$(ls -t "$CLAUDE_PROJECT_DIR"/*.jsonl 2>/dev/null | head -1)
         if [[ -n "$LATEST_JSONL" && -f "$LATEST_JSONL" ]]; then
             BASENAME=$(basename "$LATEST_JSONL" .jsonl)
-            mv "$LATEST_JSONL" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}.jsonl"
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            mv "$LATEST_JSONL" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}_${TIMESTAMP}.jsonl"
             if [[ -d "${CLAUDE_PROJECT_DIR}/${BASENAME}" ]]; then
-                mv "${CLAUDE_PROJECT_DIR}/${BASENAME}" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}"
+                mv "${CLAUDE_PROJECT_DIR}/${BASENAME}" "${CLAUDE_PROJECT_DIR}/${op_name}_${STATUS}_${TIMESTAMP}"
             fi
         fi
     done
@@ -345,4 +347,5 @@ if [[ "$USE_PARALLEL" == true ]]; then
     echo "NPU 日志目录: ${OUTPUT_DIR}/"
 fi
 echo "================================================================"
+
 
