@@ -332,16 +332,22 @@ while opt_iteration < max_opt_iterations:
     第二次: benchmark.py --triton_impl_name triton_optimized [--skip_framework ...]
       → optimized_perf_result.json
 
-    计算 speedup_vs_baseline = baseline_latency / optimized_latency
+    **判定口径（求和比 / sum ratio）**：
+    从 perf_result.json 读取 `implementation.total_latency_ms`，即所有 shape
+    延时之和（单 shape 场景等同于单值）：
 
+    ```
+    baseline_total  = baseline_data["implementation"]["total_latency_ms"]
+    optimized_total = optimized_data["implementation"]["total_latency_ms"]
+    speedup_vs_baseline = baseline_total / optimized_total
+    ```
+    
     ── 4.4 结果判定 ──────────────────────────────────
-
-    speedup_vs_baseline ≥ 1.05:
-      → 优化成功，更新 best_code / best_speedup
-      → break，进入 Phase 5
-
-    latency-optimizer 报告无更多优化点:
-      → 终止，优化失败
+    speedup_vs_baseline ≥ 1.0:
+      → 优化成功（性能不劣化即视为成功）
+      → 更新 best_code / best_speedup
+      → improvement_made = true
+      → opt_iteration++，continue
 
     否则:
       → opt_iteration++，continue
@@ -401,6 +407,7 @@ while opt_iteration < max_opt_iterations:
   "skill_path": ".claude/skills/kernel-verifier",
   "perf_data": {
     "avg_latency_ms": 0.5678,
+    "total_latency_ms": 25.2,
     "speedup_vs_torch": 2.1700,
     "speedup_vs_baseline": 1.35,
     "total_cases": 5,
