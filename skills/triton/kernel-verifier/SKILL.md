@@ -136,37 +136,42 @@ python3 /path/to/kernel-verifier/scripts/verify.py \
 
 ## Step 3: 收集验证结果
 
-根据脚本的退出码和输出判断验证结果：
+verify.py 会在 `verify_dir` 下生成 `verify_result.json`（或 `--output` 指定路径），包含：
 
-### 验证通过
+```json
+{
+  "op_name": "softmax",
+  "total_cases": 5,
+  "passed_cases": 4,
+  "failed_cases": 1,
+  "failures": [
+    {
+      "case_idx": 2,
+      "input_desc": [
+        {"type": "tensor", "shape": [128, 256], "dtype": "torch.float16"}
+      ],
+      "error_type": "CompilationError",
+      "error_msg": "..."
+    }
+  ]
+}
+```
 
-脚本 stdout 输出 `"验证成功"` 且退出码为 0。
+**多 shape 行为**：每个 shape 独立 try/except，失败不中止后续 shape；全部跑完才落盘并退出。
 
-返回：
-- `verifier_result = true`
-- `verifier_error = ""`
+**退出码语义（策略 A：严格）**：
+- `passed_cases == total_cases` → exit 0，`verifier_result = true`
+- `passed_cases <  total_cases` → exit 1，`verifier_result = false`，`verifier_error` 应读取 `verify_result.json.failures` 的**全部条目**（不是第一个），汇总后提交给 Conductor。
 
-### 验证失败
-
-脚本 stderr 包含错误信息且退出码非 0。
-
-返回：
-- `verifier_result = false`
-- `verifier_error` = stderr 中的完整错误输出（包括 AssertionError 信息和 traceback）
-
-### 超时
-
-脚本输出 `"验证超时"` 且退出码为 1。
-
-返回：
-- `verifier_result = false`
-- `verifier_error = "验证超时（300秒）"`
+**超时**：脚本输出 `"验证超时"` 且退出码为 1 → `verifier_error = "验证超时（{timeout}秒）"`。
 
 ---
 
 ## Step 4: 执行性能测试（验证通过后执行）
 
-**仅在验证通过后执行**，使用 `bash` 工具调用本 skill 自带的 `scripts/benchmark.py` 脚本。
+**前置条件**：仅在 verify.py 的 `passed_cases == total_cases` 时执行（策略 A）。verify 有任何失败 → 禁止执行 benchmark.py。
+
+使用 `bash` 工具调用本 skill 自带的 `scripts/benchmark.py` 脚本。
 
 **命令模板**：
 
@@ -218,25 +223,49 @@ python3 /path/to/kernel-verifier/scripts/benchmark.py \
   "op_name": "softmax",
   "warmup": 5,
   "repeats": 50,
+  "total_cases": 3,
+  "passed_cases": 3,
+  "failed_cases": 0,
   "framework": {
     "avg_latency_ms": 1.2345,
-    "peak_memory_mb": 256.00
+    "peak_memory_mb": 256.00,
+    "operators": {"...": 0.0}
   },
   "implementation": {
     "avg_latency_ms": 0.5678,
-    "peak_memory_mb": 128.00
+    "peak_memory_mb": 128.00,
+    "operators": {"...": 0.0}
   },
-  "speedup_vs_torch": 2.17
+  "speedup_vs_torch": 2.1746,
+  "total_framework_latency_ms": 3.7035,
+  "total_implementation_latency_ms": 1.7034,
+  "per_shape_results": [
+    {
+      "case_idx": 1,
+      "input_desc": [{"type":"tensor","shape":[128,256],"dtype":"torch.float16"}],
+      "status": "pass",
+      "framework": {"avg_latency_ms": 1.23, "peak_memory_mb": 64.0},
+      "implementation": {"avg_latency_ms": 0.56, "peak_memory_mb": 32.0},
+      "speedup_vs_torch": 2.19,
+      "error_type": null,
+      "error_msg": null
+    }
+  ]
 }
 ```
 
-**指标说明**：
+**字段说明**：
 
 | 指标 | 说明 |
 |------|------|
-| `avg_latency_ms` | 平均延迟（毫秒）|
+| `avg_latency_ms` | 各 shape 延时的算术平均（兼容语义）|
 | `peak_memory_mb` | 峰值内存占用（MB）|
-| `speedup_vs_torch` | 相比原生 PyTorch 实现的加速比 |
+| `total_*_latency_ms` | **所有通过 shape 延时之和**（仅 status==pass 的 shape）|
+| `speedup_vs_torch` | **延时加权加速比** = `total_framework_latency_ms / total_implementation_latency_ms` |
+| `passed_cases` / `failed_cases` | 多 shape 通过 / 失败计数 |
+| `per_shape_results[].status` | `"pass"` 或 `"fail"` |
+
+**退出码**：benchmark.py 永远 exit 0（除非脚本本身崩溃）；调用方通过读 JSON 判断 `passed_cases == total_cases`。
 
 **返回**：
 - `perf_result`：dict（完整性能数据）
@@ -275,5 +304,5 @@ python3 /path/to/kernel-verifier/scripts/benchmark.py \
 
 **CLI 参数**：
 - `validate_triton_impl.py`: `<file_path>`, `[--json]`
-- `verify.py`: `--op_name`, `--verify_dir`, `--triton_impl_name`, `--timeout`
-- `benchmark.py`: `--op_name`, `--verify_dir`, `--triton_impl_name`, `--warmup`, `--repeats`, `--output`
+- `verify.py`: `--op_name`, `--verify_dir`, `--triton_impl_name`, `--timeout`, `--output`
+- `benchmark.py`: `--op_name`, `--verify_dir`, `--triton_impl_name`, `--warmup`, `--repeats`, `--output`, `--skip_framework`, `--framework_latency_ms`

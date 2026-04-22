@@ -82,19 +82,25 @@ python3 -c "import datetime,random; ts=datetime.datetime.now().strftime('%Y%m%d_
 
 ### 模式 A：标准 KernelBench
 
-当描述文件为 PyTorch `nn.Module` 实现时，调用 `op-task-extractor` skill，从用户描述中构建 KernelBench 格式的任务描述文件。
+调用 `op-task-extractor` skill。skill 会先做模式判定（依据：源 `.py` 是否含 `get_input_groups` / 同目录是否存在同名 `.json`），再走对应分支：
 
-**产出**：`{工作目录}/{op_name}.py`（仅包含 Model 类 + 输入函数 + `get_init_inputs()`，不含测试驱动）。
+#### A.1 单 case 子模式（典型来源：`benchmarks/KernelBench/`）
 
-**输入函数格式**：
-- 单 shape 场景：使用 `get_inputs()` 返回单组输入
-- 多 shape 场景：使用 `get_input_groups()` 返回多组输入列表，每组输入对应一个测试 shape
+- 源 `.py` 仅含 `get_inputs()`，`forward` 单组输入
+- skill 在工作目录构造单一自包含任务文件 `{op_name}.py`
+- 包含 `Model` + `get_inputs()` + `get_init_inputs()`，不含测试驱动
 
-**多 shape 场景处理**：
-当用户提供多个 shape 配置或明确表示需要测试多种输入大小时：
-- 任务文件应提供 `get_input_groups()` 函数，返回 `List[List[Tensor/...]]`
-- 每组输入对应一个 shape 配置，例如：`[[tensor1_shapeA, tensor2_shapeA], [tensor1_shapeB, tensor2_shapeB], ...]`
-- 验证和性能测试将遍历所有 shape 组，输出每个 shape 的性能数据
+#### A.2 多 case 子模式（典型来源：`benchmarks/level430/` 和 `benchmarks/NPUKernelBench/`）
+
+- 源 `.py` 含 `get_input_groups()`，**同目录**配套 `{op_name}.json`（JSONL，每行一个 case 输入规格）
+- skill **原样透传两个文件**到工作目录：
+  - `{工作目录}/{op_name}.py`（源 `.py` 字节级副本，禁止改写）
+  - `{工作目录}/{op_name}.json`（源 JSON 字节级副本，必须与 `.py` 同名同目录）
+- **严禁**将多 case 源裁剪为单 case 任务文件（会丢失 N-1 个 shape 的评测结果）
+
+**通用要求**：
+- 所有任务文件必须通过 `validate_task.py` 检查（多 case 模式下需遍历全部 groups 通过）
+- 下游 `verify.py` / `benchmark.py` 已内建分支判断（优先 `get_input_groups`、回落 `get_inputs`），无需在任务文件追加兼容层
 
 ### 模式 B：GPU Kernel 输入模式（TritonNPUKernelBench）
 
@@ -184,13 +190,20 @@ while iteration < max_iterations:
       - {op_name}_torch.py               (来自任务文件)
       - {op_name}_triton_ascend_impl.py   (来自生成代码)
 
-    验证通过:
+    **多 shape 全量执行**：verify.py 会为每个 shape 独立 try/except，
+    全部跑完后落盘 verify_result.json（位于 verify_dir 下），包含：
+      - total_cases / passed_cases / failed_cases
+      - failures: 只列失败用例 [{case_idx, input_desc, error_type, error_msg(截断2000)}]
+    退出码：passed_cases == total_cases → 0；否则 → 1（策略 A：严格）。
+
+    验证通过 (exit 0 且 passed == total):
       复制 iter_{iteration}/generated_code.py → {工作目录}/output/generated_code.py
       → 跳到 3.5 性能测试
 
-    验证失败:
+    验证失败 (exit 非 0 或 passed < total):
       删除 {工作目录}/output/generated_code.py（如存在）
-      → 跳到 3.4 Conductor
+      从 verify_result.json 读取 **全部 failures**，汇总为 verifier_error
+      → 跳到 3.4 Conductor（Conductor 收到所有失败 shape 的错误清单，不只是第一个）
 
     **GPU Kernel 模式下的特殊处理**：
     - 若 `Model` 为首选方案（直接返回 `gpu_output`），`verify.py` 的精度比对天然通过，但 `framework` 延迟不具备实际意义，应在报告中明确标注。
@@ -216,6 +229,7 @@ while iteration < max_iterations:
         → continue
 
     ── 3.5 性能测试 ──────────────────────────────────
+    **前置条件**：Phase 3.3 必须 passed_cases == total_cases，否则严禁执行 benchmark.py。
     调用 kernel-verifier skill (benchmark.py)
 
     **GPU Kernel 模式**：需附加 `--skip_framework --framework_latency_ms <gpu_reference_ms>`，其中 `gpu_reference_ms` 由 `vllm_gpu_perf.csv` 中的 `Duration(us)` 转换而来（除以 1000）。避免对无意义的预存 GPU 输出 Model 进行 profiling。
@@ -223,12 +237,17 @@ while iteration < max_iterations:
     产物 → {工作目录}/output/iter_{iteration}/perf_result.json
     复制 → {工作目录}/output/perf_result.json
 
-    **多 shape 性能数据处理**：
-    - 若 `total_cases > 1`（即原任务使用 `get_input_groups()`），`perf_result.json` 包含：
-      - 顶层聚合数据：`framework.avg_latency_ms`、`implementation.avg_latency_ms`、`speedup_vs_torch`
-      - 明细数据：`per_shape_results` 数组，每个元素包含单个 shape 的性能数据
-    - 报告输出时显示：汇总平均指标 + 每个 shape 的明细表格
-    - 判定性能成功标准：以汇总 `speedup_vs_torch > 1.0` 为基准（存在优化空间）
+    **多 shape 全量执行 + 延时加权聚合**：
+    - benchmark.py 为每个 shape 独立 try/except，全部跑完后写 JSON；exit 恒为 0（除非脚本崩溃）。
+    - 顶层汇总字段：
+      - `total_cases` / `passed_cases` / `failed_cases`
+      - `framework.avg_latency_ms` / `implementation.avg_latency_ms`（各 shape 延时的算术平均，保留兼容语义）
+      - `total_framework_latency_ms` / `total_implementation_latency_ms`（仅通过 shape 求和）
+      - `speedup_vs_torch` = **sum(framework) / sum(impl)**（延时加权；仅对 status=="pass" 的 shape 求和）
+    - 明细字段 `per_shape_results[]` 保留全量（含失败用例），每项带 `status: "pass"|"fail"`、
+      通过时 `framework/implementation/speedup_vs_torch`，失败时 `error_type/error_msg`。
+    - 报告输出时显示：顶部汇总（含通过率+延时加权加速比）+ 每个 shape 明细表格（含 status 列）。
+    - 策略 A 下 Phase 3.5 由于前置条件保证 passed_cases == total_cases，因此 benchmark 不会混入失败 shape。
 
     记录 perf_data（包含汇总指标和 shape 明细），break
 
@@ -316,11 +335,12 @@ while opt_iteration < max_opt_iterations:
       - {op_name}_triton_baseline.py    (Phase 3 基线)
       - {op_name}_triton_optimized.py   (优化后)
 
-    第一次: verify.py --triton_impl_name triton_baseline
-    第二次: verify.py --triton_impl_name triton_optimized
+    第一次: verify.py --triton_impl_name triton_baseline  →  verify_result_baseline.json
+    第二次: verify.py --triton_impl_name triton_optimized →  verify_result_optimized.json
 
-    两次都通过 → 继续 4.3
-    任一失败   → 跳到 4.5
+    **策略 A 判定**：两次均要求 `passed_cases == total_cases`。
+      两者都全过 → 继续 4.3
+      任一未全过 → 跳到 4.5（视为 A 类，记录两份 verify_result.json 的 failures 清单供优化器分析）
 
     ── 4.3 双重性能测试 ──────────────────────────────
     调用 kernel-verifier skill (benchmark.py) 两次
@@ -332,16 +352,25 @@ while opt_iteration < max_opt_iterations:
     第二次: benchmark.py --triton_impl_name triton_optimized [--skip_framework ...]
       → optimized_perf_result.json
 
-    计算 speedup_vs_baseline = baseline_latency / optimized_latency
+    **延时加权判定（sum ratio）**：
+    从 perf_result.json 读取 `total_implementation_latency_ms`，即所有通过 shape
+    延时之和（单 shape 场景等同于单值）：
 
+    ```
+    baseline_total  = baseline_data["total_implementation_latency_ms"]
+    optimized_total = optimized_data["total_implementation_latency_ms"]
+    speedup_vs_baseline = baseline_total / optimized_total
+    ```
+
+    策略 A 下 4.2 已保证两侧均 passed == total，故集合相同，可直接相除。
+    若出现集合不一致（兼容路径），应直接判优化失败，不写入比较数值。
+    
     ── 4.4 结果判定 ──────────────────────────────────
-
-    speedup_vs_baseline ≥ 1.05:
-      → 优化成功，更新 best_code / best_speedup
-      → break，进入 Phase 5
-
-    latency-optimizer 报告无更多优化点:
-      → 终止，优化失败
+    speedup_vs_baseline ≥ 1.0:
+      → 优化成功（性能不劣化即视为成功）
+      → 更新 best_code / best_speedup
+      → improvement_made = true
+      → opt_iteration++，continue
 
     否则:
       → opt_iteration++，continue
@@ -377,13 +406,15 @@ while opt_iteration < max_opt_iterations:
 **写入 `{工作目录}/report.md`**：
 - 基本信息：arch、工作目录
 - 生成结果：迭代次数、最终版本来源
+- **Shape 通过率**：`passed_cases / total_cases`（策略 A 下应为 N/N；若出现 N<total 代表脚本异常退出前的最后状态）
 - **GPU 参考性能**（仅在 GPU Kernel 模式下且找到 `gpu_perf_csv` 时显示）：
   - GPU 参考延迟
   - Ascend Triton 延迟
   - Ascend/GPU 倍数
-- 性能数据：加速比（保留 4 位小数）、延迟
+- 性能数据：**延时加权加速比**（保留 4 位小数）、总延时、平均延迟
 - 性能明细：读取 `output/perf_result.json` 中的 `per_shape_results`（如 `total_cases == 1`，则显示单条记录；多 shape 时显示多行），
-  以 Markdown 表格形式输出各 shape 的 framework 延迟、implementation 延迟和 speedup（保留 4 位小数）。
+  以 Markdown 表格形式输出各 shape 的 **status**、framework 延迟、implementation 延迟、speedup（保留 4 位小数）；
+  失败 shape 在表格中以 `status=fail` 行展示并附 `error_type`。
 - 代码路径：`{op_name}_generated.py`
 
 **写入 `{工作目录}/summary.json`**：
@@ -401,17 +432,26 @@ while opt_iteration < max_opt_iterations:
   "skill_path": ".claude/skills/kernel-verifier",
   "perf_data": {
     "avg_latency_ms": 0.5678,
-    "speedup_vs_torch": 2.1700,
+    "total_framework_latency_ms": 54.8,
+    "total_implementation_latency_ms": 25.2,
+    "speedup_vs_torch": 2.1746,
     "speedup_vs_baseline": 1.35,
     "total_cases": 5,
+    "passed_cases": 5,
+    "failed_cases": 0,
     "per_shape_results": [
-      {"shape": [128], "speedup_vs_torch": 1.8200},
-      {"shape": [256, 256], "speedup_vs_torch": 2.1500},
-      {"shape": [1024, 1024], "speedup_vs_torch": 2.3100}
+      {"case_idx": 1, "status": "pass", "shape_desc": "...", "speedup_vs_torch": 1.8200},
+      {"case_idx": 2, "status": "pass", "shape_desc": "...", "speedup_vs_torch": 2.1500},
+      {"case_idx": 3, "status": "pass", "shape_desc": "...", "speedup_vs_torch": 2.3100}
     ]
   }
 }
 ```
+
+**字段说明**：
+- `speedup_vs_torch`: **延时加权**聚合 = `total_framework_latency_ms / total_implementation_latency_ms`（仅对通过 shape 求和）
+- `passed_cases` / `failed_cases`: 多 shape 时的通过 / 失败计数（策略 A 成功时应为 total / 0）
+- `total_framework_latency_ms` / `total_implementation_latency_ms`: 所有通过 shape 延时之和
 
 **GPU Kernel 模式扩展格式**（向后兼容）：
 ```json
@@ -472,6 +512,26 @@ Phase 4 失败时（Phase 3 成功，优化未成功）：
   }
 }
 ```
+### 6 会话导出（session.jsonl + session.md）
+
+Phase 5 **最末尾**（`summary.json`、`report.md` 写完之后）执行，将当前 Claude Code 会话归档到工作目录，便于复盘。放在最末尾是为了最大化 jsonl 完整性——仍会缺失本步骤之后的极少量消息，可接受。
+
+并行批量执行（`run_benchmark_triton.sh --npu-list`）下，多个子进程共用同一个 `/root/.claude/projects/<hash>/` 目录，**必须用工作目录路径精确过滤**，禁止用时间排序（`ls -t | head -1` 会错拿到其它并发子进程的 jsonl）。
+
+```bash
+# 用工作目录绝对路径作为唯一标记定位自己的 session jsonl
+MY_JSONL=$(grep -l "{工作目录}" /root/.claude/projects/*/*.jsonl 2>/dev/null | head -1)
+if [ -n "$MY_JSONL" ]; then
+  cp "$MY_JSONL" {工作目录}/session.jsonl
+  python3 ./utils/render_session.py \
+    {工作目录}/session.jsonl {工作目录}/session.md 2>&1 || \
+    echo "WARN: session render failed (non-fatal)"
+else
+  echo "WARN: session jsonl not located (non-fatal)"
+fi
+```
+
+⚠️ 渲染失败 / 定位失败均不阻塞任务，仅告警。
 
 ---
 
@@ -480,6 +540,7 @@ Phase 4 失败时（Phase 3 成功，优化未成功）：
 ```
 ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 ├── {op_name}.py                          # Phase 1: KernelBench 任务描述
+├── {op_name}.json                        # Phase 1: 多 case 模式专属（与 .py 同名同目录）
 ├── sketch.txt                            # Phase 2: 算法草图
 ├── output/
 │   ├── generated_code.py                 # Phase 3 最终通过验证的代码（副本）
@@ -489,7 +550,8 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 │   │   ├── generated_code.py
 │   │   ├── verify/
 │   │   │   ├── {op_name}_torch.py
-│   │   │   └── {op_name}_triton_ascend_impl.py
+│   │   │   ├── {op_name}_triton_ascend_impl.py
+│   │   │   └── verify_result.json         # 各 shape 通过 / 失败统计，失败清单
 │   │   ├── perf_result.json
 │   │   └── log.md
 │   ├── iter_1/                           # Phase 3 第 1 轮（如有）
@@ -499,7 +561,9 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 │   │   ├── verify/
 │   │   │   ├── {op_name}_torch.py
 │   │   │   ├── {op_name}_triton_baseline.py
-│   │   │   └── {op_name}_triton_optimized.py
+│   │   │   ├── {op_name}_triton_optimized.py
+│   │   │   ├── verify_result_baseline.json
+│   │   │   └── verify_result_optimized.json
 │   │   ├── baseline_perf_result.json
 │   │   ├── optimized_perf_result.json
 │   │   └── log.md
@@ -508,6 +572,8 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 ├── {op_name}_generated.py                # Phase 5: 最终代码
 ├── summary.json                          # 执行摘要
 └── report.md                             # 最终报告
+├── session.jsonl                         # Phase 6: 当前 Claude Code 会话原始记录
+└── session.md                            # Phase 6: 会话 Markdown 渲染（渲染失败时可能缺失）
 ```
 
 ---
@@ -516,7 +582,7 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 
 | 阶段 | 错误 | 处理 |
 |------|------|------|
-| Phase 1 (模式 A) | 任务文件验证失败 | 修复重试（最多 2 次） |
+| Phase 1 (模式 A) | 任务文件验证失败 | 修复重试（最多 2 次）；多 case 模式下禁止"降级为单 case"绕过 |
 | Phase 1 (模式 B) | `.pt` 文件不存在 | 报错终止，提示用户上传同名 `.pt` |
 | Phase 1 (模式 B) | `Model` 翻译验证失败 | 修复重试（最多 2 次） |
 | Phase 3 | 达到 max_iterations | 输出失败报告，任务结束 |
