@@ -8,28 +8,28 @@ class Model(nn.Module):
     """
     Simple model that initializes routing for MoE (Mixture of Experts).
     torch_npu.npu_moe_init_routing(x, row_idx, expert_idx, active_num) -> (Tensor, Tensor, Tensor)
-    Pure PyTorch implementation (replacing torch_npu.npu_moe_init_routing):
+    Pure PyTorch reference implementation (replacing torch_npu.npu_moe_init_routing):
 
-        def forward(self, x, row_idx, expert_idx, active_num):
-            # x: [NUM_ROWS, H] input features
-            # row_idx: [NUM_ROWS, K] original row positions
-            # expert_idx: [NUM_ROWS, K] expert indices for each top-k
-            # active_num: maximum number of rows to process
-
-            NUM_ROWS, H = x.shape
+        def moe_init_routing_torch(x, row_idx, expert_idx, active_num):
+            N, H = x.shape
             K = expert_idx.shape[1]
 
-            # Flatten row_idx to get expanded row indices
-            # expanded_row_idx: [NUM_ROWS * K]
-            expanded_row_idx = row_idx.view(-1)
+            expert_flat = expert_idx.contiguous().view(-1)
+            row_flat = row_idx.contiguous().view(-1)
 
-            # Flatten expert_idx to get expanded expert indices
-            # expanded_expert_idx: [NUM_ROWS * K]
-            expanded_expert_idx = expert_idx.view(-1)
+            # Step 1: Sort by expert_idx ascending (stable), carry row_idx
+            sorted_indices = torch.argsort(expert_flat, stable=True)
+            expanded_expert_idx = expert_flat[sorted_indices]
+            dst_to_src = row_flat[sorted_indices]
 
-            # Expand x by gathering rows according to expanded_row_idx
-            # expanded_x: [NUM_ROWS * K, H]
-            expanded_x = x[expanded_row_idx.long()]
+            # Step 2: Invert mapping: src_to_dst[dst_to_src[i]] = i
+            src_to_dst = torch.zeros(N * K, dtype=torch.int32, device=x.device)
+            src_to_dst[dst_to_src.long()] = torch.arange(N * K, dtype=torch.int32, device=x.device)
+            expanded_row_idx = src_to_dst
+
+            # Step 3: Gather x rows. dst_to_src[i] % N gives original row in x
+            original_rows = dst_to_src.long() % N
+            expanded_x = x[original_rows]
 
             return expanded_x, expanded_row_idx, expanded_expert_idx
     """
@@ -77,7 +77,9 @@ def get_input_groups():
         dtype = dtype_map[x_info["dtype"]]
         
         x = torch.randn(x_info["shape"], dtype=dtype)
-        row_idx = torch.randint(0, x_info["shape"][0], row_idx_info["shape"], dtype=torch.int32)
+        num_rows = expert_idx_info["shape"][0]
+        k = expert_idx_info["shape"][1]
+        row_idx = torch.arange(num_rows * k, dtype=torch.int32).reshape(k, num_rows).transpose(1, 0).contiguous()
         expert_idx = torch.randint(0, 8, expert_idx_info["shape"], dtype=torch.int32)
         active_num = active_num_info["value"]
         input_groups.append([x, row_idx, expert_idx, active_num])
