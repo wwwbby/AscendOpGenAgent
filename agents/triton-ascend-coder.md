@@ -167,34 +167,59 @@ while iteration < max_iterations:
 
     产物 → {工作目录}/output/iter_{iteration}/generated_code.py
 
-    ── 3.2 AST 预检查 ────────────────────────────────
-    执行 validate_triton_impl.py 检测 PyTorch 退化
+    ── 3.2 AST 预检查（验证钩子） ─────────────────────
+    通过验证钩子执行退化检测，输出带签名的 JSON 结果
 
-    退化 (exit code != 0):
+    命令:
+      python3 <kernel-verifier-skill-path>/scripts/verify_hook.py ast_check \
+          --generated_code {工作目录}/output/iter_{iteration}/generated_code.py \
+          --output {工作目录}/output/iter_{iteration}/ast_check_result.json
+
+    门控检查:
+      python3 <kernel-verifier-skill-path>/scripts/phase_gate.py check \
+          --result_file {工作目录}/output/iter_{iteration}/ast_check_result.json \
+          --required_step ast_check
+
+    门控拒绝 (exit code != 0):
+      从 ast_check_result.json 的 result 字段获取 regression_type 和 suggestion
       verifier_error = "A-PyTorchFallback-Type{N}: ..."
       → 跳到 3.4 Conductor
 
-    通过 (exit code == 0):
+    门控通过 (exit code == 0):
       → 继续 3.3
 
-    ── 3.3 功能验证 ──────────────────────────────────
-    调用 kernel-verifier skill (verify.py)
+    ── 3.3 功能验证（验证钩子 + 阶段门控） ──────────
+    调用 kernel-verifier skill (通过验证钩子执行)
 
     在 {工作目录}/output/iter_{iteration}/verify/ 下创建:
       - {op_name}_torch.py               (来自任务文件)
       - {op_name}_triton_ascend_impl.py   (来自生成代码)
 
-    验证通过:
+    执行验证钩子:
+      python3 <kernel-verifier-skill-path>/scripts/verify_hook.py verify \
+          --op_name <op_name> \
+          --verify_dir {工作目录}/output/iter_{iteration}/verify/ \
+          --triton_impl_name triton_ascend_impl \
+          --timeout 900 \
+          --output {工作目录}/output/iter_{iteration}/verify_result.json
+
+    门控检查:
+      python3 <kernel-verifier-skill-path>/scripts/phase_gate.py check \
+          --result_file {工作目录}/output/iter_{iteration}/verify_result.json \
+          --required_step verify
+
+    门控通过:
       复制 iter_{iteration}/generated_code.py → {工作目录}/output/generated_code.py
       → 跳到 3.5 性能测试
 
-    验证失败:
+    门控拒绝:
       删除 {工作目录}/output/generated_code.py（如存在）
+      从 verify_result.json 的 result.error 获取错误信息
       → 跳到 3.4 Conductor
 
     **GPU Kernel 模式下的特殊处理**：
-    - 若 `Model` 为首选方案（直接返回 `gpu_output`），`verify.py` 的精度比对天然通过，但 `framework` 延迟不具备实际意义，应在报告中明确标注。
-    - 若 `Model` 为兜底方案（手写的 PyTorch 参考实现），正常走 `verify.py` 的精度比对流程。
+    - 若 `Model` 为首选方案（直接返回 `gpu_output`），验证钩子的精度比对天然通过，但 `framework` 延迟不具备实际意义，应在报告中明确标注。
+    - 若 `Model` 为兜底方案（手写的 PyTorch 参考实现），正常走验证钩子的精度比对流程。
 
     ── 3.4 Conductor 分析与决策 ──────────────────────
     (Agent 自身推理，非 Skill 调用)
@@ -215,13 +240,26 @@ while iteration < max_iterations:
         → iteration++
         → continue
 
-    ── 3.5 性能测试 ──────────────────────────────────
-    调用 kernel-verifier skill (benchmark.py)
+    ── 3.5 性能测试（验证钩子 + 阶段门控） ──────────
+    调用 kernel-verifier skill (通过验证钩子执行 benchmark)
+
+    执行性能测试钩子:
+      python3 <kernel-verifier-skill-path>/scripts/verify_hook.py benchmark \
+          --op_name <op_name> \
+          --verify_dir {工作目录}/output/iter_{iteration}/verify/ \
+          --triton_impl_name triton_ascend_impl \
+          --warmup 5 --repeats 50 \
+          --output {工作目录}/output/iter_{iteration}/benchmark_result.json
+
+    门控检查:
+      python3 <kernel-verifier-skill-path>/scripts/phase_gate.py check \
+          --result_file {工作目录}/output/iter_{iteration}/benchmark_result.json \
+          --required_step benchmark
 
     **GPU Kernel 模式**：需附加 `--skip_framework --framework_latency_ms <gpu_reference_ms>`，其中 `gpu_reference_ms` 由 `vllm_gpu_perf.csv` 中的 `Duration(us)` 转换而来（除以 1000）。避免对无意义的预存 GPU 输出 Model 进行 profiling。
 
-    产物 → {工作目录}/output/iter_{iteration}/perf_result.json
-    复制 → {工作目录}/output/perf_result.json
+    门控通过后，从 benchmark_result.json 的 result.perf_data 读取性能数据
+    复制 perf_data → {工作目录}/output/perf_result.json
 
     **多 shape 性能数据处理**：
     - 若 `total_cases > 1`（即原任务使用 `get_input_groups()`），`perf_result.json` 包含：
@@ -319,30 +357,73 @@ while True:
     
     复制 → {工作目录}/output/optimized_code.py
 
-    ── 4.2 双重验证 ──────────────────────────────────
-    调用 kernel-verifier skill 执行两次精度比对
+    ── 4.2 双重验证（验证钩子 + 阶段门控） ──────────
+    调用 kernel-verifier skill 通过验证钩子执行两次精度比对
 
     在 {工作目录}/output/opt_iter_{opt_iteration}/verify/ 下创建:
       - {op_name}_torch.py              (PyTorch 参考)
       - {op_name}_triton_baseline.py    (Phase 3 基线)
       - {op_name}_triton_optimized.py   (优化后)
 
-    第一次: verify.py --triton_impl_name triton_baseline
-    第二次: verify.py --triton_impl_name triton_optimized
+    第一次: 验证钩子验证基线
+      python3 <kernel-verifier-skill-path>/scripts/verify_hook.py verify \
+          --op_name <op_name> \
+          --verify_dir {工作目录}/output/opt_iter_{opt_iteration}/verify/ \
+          --triton_impl_name triton_baseline \
+          --output {工作目录}/output/opt_iter_{opt_iteration}/baseline_verify_result.json
 
-    两次都通过 → 继续 4.3
-    任一失败   → 跳到 4.5
+      门控检查:
+      python3 <kernel-verifier-skill-path>/scripts/phase_gate.py check \
+          --result_file {工作目录}/output/opt_iter_{opt_iteration}/baseline_verify_result.json \
+          --required_step verify
 
-    ── 4.3 双重性能测试 ──────────────────────────────
-    调用 kernel-verifier skill (benchmark.py) 两次
+    第二次: 验证钩子验证优化后
+      python3 <kernel-verifier-skill-path>/scripts/verify_hook.py verify \
+          --op_name <op_name> \
+          --verify_dir {工作目录}/output/opt_iter_{opt_iteration}/verify/ \
+          --triton_impl_name triton_optimized \
+          --output {工作目录}/output/opt_iter_{opt_iteration}/optimized_verify_result.json
+
+      门控检查:
+      python3 <kernel-verifier-skill-path>/scripts/phase_gate.py check \
+          --result_file {工作目录}/output/opt_iter_{opt_iteration}/optimized_verify_result.json \
+          --required_step verify
+
+    两次门控都通过 → 继续 4.3
+    任一门控拒绝   → 跳到 4.5
+
+    ── 4.3 双重性能测试（验证钩子 + 阶段门控） ──────
+    调用 kernel-verifier skill 通过验证钩子执行两次性能测试
 
     **GPU Kernel 模式**：两次 benchmark 均需附加 `--skip_framework --framework_latency_ms <gpu_reference_ms>`，其中 `gpu_reference_ms` 从 `vllm_gpu_perf.csv` 读取并转换为毫秒。非 GPU 模式保持原样。
 
-    第一次: benchmark.py --triton_impl_name triton_baseline [--skip_framework ...]
-      → baseline_perf_result.json
-    第二次: benchmark.py --triton_impl_name triton_optimized [--skip_framework ...]
-      → optimized_perf_result.json
+    第一次: 性能测试钩子测试基线
+      python3 <kernel-verifier-skill-path>/scripts/verify_hook.py benchmark \
+          --op_name <op_name> \
+          --verify_dir {工作目录}/output/opt_iter_{opt_iteration}/verify/ \
+          --triton_impl_name triton_baseline \
+          --output {工作目录}/output/opt_iter_{opt_iteration}/baseline_benchmark_result.json \
+          [--skip_framework --framework_latency_ms <gpu_reference_ms>]
 
+      门控检查:
+      python3 <kernel-verifier-skill-path>/scripts/phase_gate.py check \
+          --result_file {工作目录}/output/opt_iter_{opt_iteration}/baseline_benchmark_result.json \
+          --required_step benchmark
+
+    第二次: 性能测试钩子测试优化后
+      python3 <kernel-verifier-skill-path>/scripts/verify_hook.py benchmark \
+          --op_name <op_name> \
+          --verify_dir {工作目录}/output/opt_iter_{opt_iteration}/verify/ \
+          --triton_impl_name triton_optimized \
+          --output {工作目录}/output/opt_iter_{opt_iteration}/optimized_benchmark_result.json \
+          [--skip_framework --framework_latency_ms <gpu_reference_ms>]
+
+      门控检查:
+      python3 <kernel-verifier-skill-path>/scripts/phase_gate.py check \
+          --result_file {工作目录}/output/opt_iter_{opt_iteration}/optimized_benchmark_result.json \
+          --required_step benchmark
+
+    门控通过后，从各自的 benchmark_result.json 的 result.perf_data 读取性能数据
     计算 speedup_vs_baseline = baseline_latency / optimized_latency
 
     ── 4.4 结果判定 ──────────────────────────────────
@@ -556,7 +637,8 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 | A 类连续上限 | 同一子类型连续 ≥ 3 次 → 自动终止 |
 | 禁止 PyTorch 退化 | forward() 中禁止 torch.*/F.* 计算操作 |
 | 文件操作范围 | 限制在工作目录内 |
-| 验证方式 | 必须调用 kernel-verifier skill 的脚本，禁止自创测试 |
+| 验证方式 | 必须通过验证钩子（verify_hook.py）和阶段门控（phase_gate.py），禁止自创测试 |
+| 验证结果 | 禁止修改验证结果 JSON 文件内容（签名会失效），禁止忽略门控检查的非零退出码 |
 | 语言 | 思考、分析、日志使用中文；代码、路径使用英文 |
 | 时间戳/随机数 | 必须通过 bash 获取，禁止 LLM 模拟 |
 
