@@ -59,6 +59,7 @@ argument-hint: >
    - 每种实现的平均耗时
    - 相对于参考实现的加速比
    - TileLang vs AscendC 的对比（仅在两者都被实际测试时提供）
+   - 输出`preformance.json`，用于记录每个case的加速比
 
 ## 输出格式
 
