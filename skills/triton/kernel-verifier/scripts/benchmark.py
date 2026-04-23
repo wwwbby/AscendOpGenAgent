@@ -32,6 +32,8 @@ class BenchmarkConfig:
     triton_impl_name: str = TRITON_IMPL_NAME_DEFAULT
     warmup: int = WARMUP_DEFAULT
     repeats: int = REPEATS_DEFAULT
+    skip_framework: bool = False
+    framework_latency_ms: float = 0.0
 
 
 @dataclass
@@ -43,6 +45,15 @@ class PerformanceResult:
 
 
 @dataclass
+class SingleShapeResult:
+    """单个形状的性能测试结果"""
+    shape: List[int]  # 主要输入的形状
+    framework: PerformanceResult
+    implementation: PerformanceResult
+    speedup_vs_torch: float
+
+
+@dataclass
 class BenchmarkResult:
     """完整性能测试结果"""
     op_name: str
@@ -51,14 +62,46 @@ class BenchmarkResult:
     framework: PerformanceResult
     implementation: PerformanceResult
     speedup_vs_torch: float
+    total_cases: int = 1
+    per_shape_results: List[SingleShapeResult] = None
+
+    def __post_init__(self):
+        if self.per_shape_results is None:
+            self.per_shape_results = []
 
 
 # ============================================================================
 # 辅助函数
 # ============================================================================
 
-def load_models(op_name: str, verify_dir: str, triton_impl_name: str, device: Any):
-    """加载框架实现和Triton实现模型"""
+def resolve_inputs(op_name: str, verify_dir: str):
+    """解析任务文件的输入提供方式。
+
+    支持两种格式：
+        - get_inputs(): 旧格式，返回单组输入
+        - get_input_groups(): 新格式，返回多组输入列表
+
+    Returns:
+        输入组列表 (List[List[Any]])
+    """
+    import torch
+    sys.path.insert(0, verify_dir)
+    torch_module = __import__(f"{op_name}_torch")
+    
+    if hasattr(torch_module, "get_input_groups"):
+        # 新格式：多组输入（如 26_GELU_.py 有多个 shape 用例）
+        return torch_module.get_input_groups()
+    elif hasattr(torch_module, "get_inputs"):
+        # 旧格式：单组输入（封装为列表）
+        return [torch_module.get_inputs()]
+    else:
+        raise AttributeError(
+            "模块必须提供 get_inputs() 或 get_input_groups() 方法"
+        )
+
+
+def load_models(op_name: str, verify_dir: str, triton_impl_name: str, device: Any, inputs: List[Any]):
+    """加载框架实现和Triton实现模型，并迁移输入到设备。"""
     import torch
     import torch_npu
     
@@ -68,12 +111,12 @@ def load_models(op_name: str, verify_dir: str, triton_impl_name: str, device: An
     impl_module = __import__(f"{op_name}_{triton_impl_name}")
     
     FrameworkModel = torch_module.Model
-    get_inputs = torch_module.get_inputs
     get_init_inputs = torch_module.get_init_inputs
     ModelNew = impl_module.ModelNew
     
     init_params = get_init_inputs()
     
+    # 创建模型（确保权重一致）
     torch.manual_seed(0)
     torch.npu.manual_seed(0)
     framework_model = FrameworkModel(*init_params).to(device)
@@ -82,11 +125,10 @@ def load_models(op_name: str, verify_dir: str, triton_impl_name: str, device: An
     torch.npu.manual_seed(0)
     impl_model = ModelNew(*init_params).to(device)
     
-    torch.manual_seed(0)
-    torch.npu.manual_seed(0)
-    inputs = get_inputs()
+    # 迁移输入到设备
+    inputs_device = [x.to(device) if isinstance(x, torch.Tensor) else x for x in inputs]
     
-    return framework_model, impl_model, inputs, device
+    return framework_model, impl_model, inputs_device
 
 
 def prepare_model_fn(model: Any, inputs: List[Any], device: Any) -> callable:
@@ -277,9 +319,9 @@ def measure_single(
         print(f"torch_npu.profiler 获取数据失败: {e}，使用兜底测试机制...")
         operators, latency_ms = None, None
 
-    # 如果profiler获取不到数据，使用兜底机制
-    if operators is None or latency_ms is None:
-        print(f"警告: profiler 无法获取时延数据，将使用 time.perf_counter() 进行兜底测试...")
+    # 如果profiler获取不到数据或时延为0/无效，使用兜底机制
+    if operators is None or latency_ms is None or latency_ms <= 0.0001:
+        print(f"警告: profiler 无法获取有效时延数据（当前:{latency_ms} ms），将使用 time.perf_counter() 进行兜底测试...")
         return measure_single_fallback(model, inputs, warmup, repeats, device)
 
     # 获取峰值内存
@@ -332,58 +374,82 @@ def measure_single_fallback(
 # 主测试逻辑
 # ============================================================================
 
-def benchmark_implementations(config: BenchmarkConfig) -> BenchmarkResult:
-    """执行完整的性能测试"""
-    import torch
-    import torch_npu
-    
-    device = torch.device("npu")
-    
-    # 加载模型和输入
-    framework_model, impl_model, inputs, device = load_models(
-        config.op_name, 
-        config.verify_dir, 
-        config.triton_impl_name,
-        device
-    )
-    
-    # 将输入移到设备上
-    torch.manual_seed(0)
-    torch.npu.manual_seed(0)
-    inputs_framework = [x.to(device) if isinstance(x, torch.Tensor) else x for x in inputs]
-    
-    torch.manual_seed(0)
-    torch.npu.manual_seed(0)
+def get_main_shape(inputs: List[Any]) -> List[int]:
+    """获取主要输入张量的形状。
+
+    注意: 此函数依赖 torch，应在已导入 torch 的上下文中调用，
+    或由 run_single_benchmark() 调用（该函数所在调用链会导入 torch）。
+    """
+    import torch  # 延迟导入：确保 torch 在此作用域可用
+    for x in inputs:
+        if isinstance(x, torch.Tensor):
+            return list(x.shape)
+    return []
+
+
+def run_single_benchmark(
+    framework_model: Any,
+    impl_model: Any,
+    inputs: List[Any],
+    config: BenchmarkConfig,
+    device: Any,
+    case_idx: int,
+    total_cases: int
+) -> SingleShapeResult:
+    """对单组输入进行性能测试（支持跳过 framework 测试）。
+
+    注意: 此函数依赖 torch 和 torch_npu，应在已导入这些模块的上下文中调用。
+
+    Args:
+        framework_model: 参考实现模型
+        impl_model: 生成的实现模型
+        inputs: 输入张量/参数列表
+        config: 测试配置
+        device: NPU 设备
+        case_idx: 当前用例序号（从1开始）
+        total_cases: 总用例数
+    Returns:
+        SingleShapeResult: 包含形状和性能数据的结果
+    """
+    import torch  # 延迟导入：函数内导入避免顶层依赖
+
+    print(f"  测试第 {case_idx}/{total_cases} 组输入...")
+
     inputs_impl = [x.to(device) if isinstance(x, torch.Tensor) else x for x in inputs]
-    
-    # 测试框架实现
-    print(f"执行 Framework warmup 和 profiler (warmup={config.warmup}, active={config.repeats})...")
-    framework_operators, framework_latency_ms, framework_peak_memory = measure_single(
-        framework_model, inputs_framework, config.warmup, config.repeats, "framework_profile", device
-    )
+
+    if config.skip_framework:
+        print(f"    跳过 Framework 测试，使用参考延迟: {config.framework_latency_ms:.4f} ms")
+        framework_operators: Dict[str, float] = {}
+        framework_latency_ms = config.framework_latency_ms
+        framework_peak_memory = 0.0
+    else:
+        inputs_framework = [x.to(device) if isinstance(x, torch.Tensor) else x for x in inputs]
+        print(f"    测试 Framework (warmup={config.warmup}, active={config.repeats})...")
+        framework_operators, framework_latency_ms, framework_peak_memory = measure_single(
+            framework_model, inputs_framework, config.warmup, config.repeats, 
+            f"framework_profile_case{case_idx}", device
+        )
     
     # 测试生成实现
-    print(f"执行 Implementation warmup 和 profiler (warmup={config.warmup}, active={config.repeats})...")
+    print(f"    测试 Implementation (warmup={config.warmup}, active={config.repeats})...")
     impl_operators, impl_latency_ms, impl_peak_memory = measure_single(
-        impl_model, inputs_impl, config.warmup, config.repeats, "impl_profile", device
+        impl_model, inputs_impl, config.warmup, config.repeats, 
+        f"impl_profile_case{case_idx}", device
     )
     
-    # 验证结果
-    if framework_latency_ms is None or impl_latency_ms is None:
-        raise RuntimeError("无法从 profiler 结果中提取有效的时延数据")
+    if (not config.skip_framework and framework_latency_ms is None) or impl_latency_ms is None:
+        raise RuntimeError(
+            f"[用例 {case_idx}/{total_cases}] 无法从 profiler 提取有效时延数据"
+        )
     
-    # 计算加速比
     speedup = (
         framework_latency_ms / impl_latency_ms 
         if impl_latency_ms > 0 and framework_latency_ms > 0 
         else 0
     )
     
-    # 构建结果
-    return BenchmarkResult(
-        op_name=config.op_name,
-        warmup=config.warmup,
-        repeats=config.repeats,
+    return SingleShapeResult(
+        shape=get_main_shape(inputs),
         framework=PerformanceResult(
             avg_latency_ms=round(framework_latency_ms, 4),
             peak_memory_mb=round(framework_peak_memory, 2),
@@ -394,16 +460,126 @@ def benchmark_implementations(config: BenchmarkConfig) -> BenchmarkResult:
             peak_memory_mb=round(impl_peak_memory, 2),
             operators=impl_operators or {}
         ),
-        speedup_vs_torch=round(speedup, 2)
+        speedup_vs_torch=round(speedup, 4)
+    )
+
+
+def compute_overall_average(results: List[SingleShapeResult]) -> Tuple[PerformanceResult, PerformanceResult, float]:
+    """计算多组结果的总体平均值。
+
+    Args:
+        results: SingleShapeResult 列表
+    Returns:
+        (avg_framework, avg_implementation, avg_speedup)
+    """
+    import statistics
+    
+    if not results:
+        raise RuntimeError("没有有效的测试结果")
+    
+    if len(results) == 1:
+        return results[0].framework, results[0].implementation, results[0].speedup_vs_torch
+    
+    # 计算平均值
+    fw_latencies = [r.framework.avg_latency_ms for r in results]
+    impl_latencies = [r.implementation.avg_latency_ms for r in results]
+    fw_memories = [r.framework.peak_memory_mb for r in results]
+    impl_memories = [r.implementation.peak_memory_mb for r in results]
+    speedups = [r.speedup_vs_torch for r in results]
+    
+    # 合并算子时间
+    fw_ops: Dict[str, float] = {}
+    impl_ops: Dict[str, float] = {}
+    for r in results:
+        for op, t in r.framework.operators.items():
+            fw_ops[op] = fw_ops.get(op, 0) + t
+        for op, t in r.implementation.operators.items():
+            impl_ops[op] = impl_ops.get(op, 0) + t
+    
+    n = len(results)
+    
+    return (
+        PerformanceResult(
+            avg_latency_ms=round(statistics.mean(fw_latencies), 4),
+            peak_memory_mb=round(statistics.mean(fw_memories), 2),
+            operators={k: round(v / n, 4) for k, v in fw_ops.items()}
+        ),
+        PerformanceResult(
+            avg_latency_ms=round(statistics.mean(impl_latencies), 4),
+            peak_memory_mb=round(statistics.mean(impl_memories), 2),
+            operators={k: round(v / n, 4) for k, v in impl_ops.items()}
+        ),
+        round(statistics.mean(speedups), 4)
+    )
+
+
+def benchmark_implementations(config: BenchmarkConfig) -> BenchmarkResult:
+    """执行完整的性能测试，支持多组输入。"""
+    import torch
+    import torch_npu
+    
+    device = torch.device("npu")
+    
+    # 解析输入（支持单组/多组格式）
+    input_groups = resolve_inputs(config.op_name, config.verify_dir)
+    total_cases = len(input_groups)
+    
+    # 加载模块创建函数引用
+    sys.path.insert(0, config.verify_dir)
+    torch_module = __import__(f"{config.op_name}_torch")
+    impl_module = __import__(f"{config.op_name}_{config.triton_impl_name}")
+    
+    FrameworkModel = torch_module.Model
+    ModelNew = impl_module.ModelNew
+    get_init_inputs = torch_module.get_init_inputs
+    
+    # 对每组输入进行测试
+    per_shape_results: List[SingleShapeResult] = []
+    
+    for case_idx, inputs in enumerate(input_groups, start=1):
+        # 创建模型（确保权重一致）
+        init_params = get_init_inputs()
+        torch.manual_seed(0)
+        torch.npu.manual_seed(0)
+        framework_model = FrameworkModel(*init_params).to(device)
+        
+        torch.manual_seed(0)
+        torch.npu.manual_seed(0)
+        impl_model = ModelNew(*init_params).to(device)
+        
+        # 测试该组输入
+        shape_result = run_single_benchmark(
+            framework_model, impl_model, inputs, config, device, case_idx, total_cases
+        )
+        per_shape_results.append(shape_result)
+    
+    # 计算总体平均值
+    if total_cases == 1:
+        overall_fw = per_shape_results[0].framework
+        overall_impl = per_shape_results[0].implementation
+        overall_speedup = per_shape_results[0].speedup_vs_torch
+    else:
+        overall_fw, overall_impl, overall_speedup = compute_overall_average(per_shape_results)
+    
+    return BenchmarkResult(
+        op_name=config.op_name,
+        warmup=config.warmup,
+        repeats=config.repeats,
+        framework=overall_fw,
+        implementation=overall_impl,
+        speedup_vs_torch=overall_speedup,
+        total_cases=total_cases,
+        per_shape_results=per_shape_results
     )
 
 
 def result_to_dict(result: BenchmarkResult) -> Dict[str, Any]:
-    """将BenchmarkResult转换为字典格式"""
-    return {
+    """将BenchmarkResult转换为字典格式，多组输入时包含每个shape的详情"""
+    base_dict = {
         "op_name": result.op_name,
         "warmup": result.warmup,
         "repeats": result.repeats,
+        "total_cases": result.total_cases,
         "framework": {
             "avg_latency_ms": result.framework.avg_latency_ms,
             "peak_memory_mb": result.framework.peak_memory_mb,
@@ -416,6 +592,26 @@ def result_to_dict(result: BenchmarkResult) -> Dict[str, Any]:
         },
         "speedup_vs_torch": result.speedup_vs_torch
     }
+    
+    # 多组输入时，记录每组的详细结果
+    if result.total_cases > 1 and result.per_shape_results:
+        base_dict["per_shape_results"] = [
+            {
+                "shape": r.shape,
+                "framework": {
+                    "avg_latency_ms": r.framework.avg_latency_ms,
+                    "peak_memory_mb": r.framework.peak_memory_mb,
+                },
+                "implementation": {
+                    "avg_latency_ms": r.implementation.avg_latency_ms,
+                    "peak_memory_mb": r.implementation.peak_memory_mb,
+                },
+                "speedup_vs_torch": r.speedup_vs_torch
+            }
+            for r in result.per_shape_results
+        ]
+    
+    return base_dict
 
 
 # ============================================================================
@@ -431,6 +627,10 @@ def main():
     parser.add_argument("--warmup", type=int, default=WARMUP_DEFAULT, help="warmup 次数（默认 5）")
     parser.add_argument("--repeats", type=int, default=REPEATS_DEFAULT, help="正式测试次数（默认 50）")
     parser.add_argument("--output", help="输出文件路径（JSON 格式）")
+    parser.add_argument("--skip_framework", action="store_true",
+                       help="跳过 framework 性能测试（GPU Kernel 模式使用）")
+    parser.add_argument("--framework_latency_ms", type=float, default=0.0,
+                       help="预设的 framework 参考延迟（毫秒），用于计算 speedup")
     args = parser.parse_args()
     
     # 验证目录
@@ -445,7 +645,9 @@ def main():
         verify_dir=verify_dir,
         triton_impl_name=args.triton_impl_name,
         warmup=args.warmup,
-        repeats=args.repeats
+        repeats=args.repeats,
+        skip_framework=args.skip_framework,
+        framework_latency_ms=args.framework_latency_ms,
     )
     
     try:
@@ -457,7 +659,7 @@ def main():
         print("\n性能测试结果:")
         print(f"  框架实现 - 平均延迟: {result_dict['framework']['avg_latency_ms']:.4f} ms")
         print(f"  生成实现 - 平均延迟: {result_dict['implementation']['avg_latency_ms']:.4f} ms")
-        print(f"  加速比: {result_dict['speedup_vs_torch']:.2f}x")
+        print(f"  加速比: {result_dict['speedup_vs_torch']:.4f}x")
         print(f"  生成实现 - 峰值内存: {result_dict['implementation']['peak_memory_mb']:.2f} MB")
         
         # 保存到文件或输出
