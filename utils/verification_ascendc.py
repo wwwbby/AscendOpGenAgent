@@ -510,6 +510,11 @@ def _run_verification(op: str):
                 ref_out = ref_model(*ref_inputs)
                 cand_out = cand_model(*cand_inputs)
 
+            if hasattr(ref_model, "postprocess_output"):
+                print("if hasattr(ref_model, postprocess_output):")
+                ref_out = ref_model.postprocess_output(ref_out, inputs)
+                cand_out = ref_model.postprocess_output(cand_out, inputs)
+                
             ref_out = _normalize_output(ref_out)
             cand_out = _normalize_output(cand_out)
 
