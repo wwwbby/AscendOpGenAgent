@@ -11,14 +11,25 @@ class Model(nn.Module):
         super(Model, self).__init__()
 
     def forward(self, grad_output: torch.Tensor, alpha: float, scale: float, input_scale: float, is_result: bool, self_or_result: torch.Tensor) -> torch.Tensor:
+        # 保存原始dtype，如果输入是fp16，转为fp32计算以提升精度
+        orig_dtype = grad_output.dtype
+        if orig_dtype == torch.float16:
+            grad_output = grad_output.float()
+            self_or_result = self_or_result.float()
+        
         mask = self_or_result <= 0
         if is_result:
             factor = torch.where(mask, input_scale * (self_or_result + alpha * scale), scale)
-            return grad_output * factor
+            result = grad_output * factor
         else:
             tmp = torch.exp(self_or_result * input_scale)
             factor = torch.where(mask, input_scale * alpha * scale * tmp, scale)
-            return grad_output * factor
+            result = grad_output * factor
+        
+        # 转回原始dtype
+        if orig_dtype == torch.float16:
+            result = result.to(orig_dtype)
+        return result
 
 
 def get_input_groups():
