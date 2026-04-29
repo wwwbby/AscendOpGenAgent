@@ -134,6 +134,18 @@ def check_runtime(code: str, file_path: str = None) -> dict:
 
     import torch
 
+    # 检测 NPU 是否可用，若可用则把 tensor 搬到 NPU 执行 forward
+    try:
+        import torch_npu
+        npu_available = torch_npu.npu.is_available()
+    except Exception:
+        npu_available = False
+
+    def _to_npu_device(x):
+        if npu_available and isinstance(x, torch.Tensor):
+            return x.npu()
+        return x
+
     def _check_tensor(t, name="output"):
         if isinstance(t, torch.Tensor):
             if torch.isnan(t).any():
@@ -153,11 +165,19 @@ def check_runtime(code: str, file_path: str = None) -> dict:
     total = len(input_groups)
     for idx, inputs in enumerate(input_groups):
         case_label = f"case[{idx}]"
+        # 若 NPU 可用，将输入 tensor 搬到 NPU 设备
+        device_inputs = [_to_npu_device(x) for x in inputs]
         try:
-            output = model(*inputs)
+            output = model(*device_inputs)
         except Exception as e:
             checks.append({"name": f"{case_label} forward", "passed": False, "error": str(e)})
             return {"passed": False, "checks": checks, "error": f"{case_label} forward error: {e}", "cases_tested": idx + 1, "cases_passed": cases_passed}
+
+        # 输出搬回 CPU 做后续检查
+        if isinstance(output, (tuple, list)):
+            output = [x.cpu() if isinstance(x, torch.Tensor) else x for x in output]
+        elif isinstance(output, torch.Tensor):
+            output = output.cpu()
 
         issues = []
         if isinstance(output, (tuple, list)):
@@ -174,7 +194,11 @@ def check_runtime(code: str, file_path: str = None) -> dict:
             return {"passed": False, "checks": checks, "error": "; ".join(issues), "cases_tested": idx + 1, "cases_passed": cases_passed}
 
         try:
-            output2 = model(*inputs)
+            output2 = model(*device_inputs)
+            if isinstance(output2, (tuple, list)):
+                output2 = [x.cpu() if isinstance(x, torch.Tensor) else x for x in output2]
+            elif isinstance(output2, torch.Tensor):
+                output2 = output2.cpu()
             if not _tensors_close(output, output2):
                 checks.append({"name": f"{case_label} consistency", "passed": False, "error": "outputs differ between runs"})
                 return {"passed": False, "checks": checks, "error": f"{case_label} consistency check failed", "cases_tested": idx + 1, "cases_passed": cases_passed}
