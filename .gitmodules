@@ -1,0 +1,3 @@
+[submodule "3rdparty/triton-ascend-kkb"]
+	path = 3rdparty/triton-ascend-kkb
+	url = https://gitcode.com/zhou_huaman/triton-ascend-kkb.git
