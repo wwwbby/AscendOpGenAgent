@@ -413,9 +413,35 @@ kernel[grid](..., BLOCK_M=128, BLOCK_N=128)
 
 **参考文档**：`references/autotune.md`
 
+### 优化点 13：Kernel 分裂优化
+
+**适用条件**：所有优化点 1-12 均已尝试完毕（无更多优化点命中），且最终 `speedup_vs_torch < 0.8`。此时某些特定 shape 模式下的性能极差拖累了整体平均，需要将 kernel 分裂为通用 kernel 和专用 kernel。
+
+**典型代码特征**：
+
+```
+perf_result.json 中：
+  speedup_vs_torch（几何平均）< 0.8
+  per_shape_results 中存在部分 shape 的 speedup_vs_torch 远低于平均值
+  例如：某些 shape speedup 仅 0.2-0.4，而其他 shape speedup 可达 1.0+
+```
+
+**判断逻辑**：
+
+- 检查是否所有优化点 1-12 均未命中（无更多常规优化点可尝试）
+- 检查最终 speedup\_vs\_torch 是否 < 0.8
+- 检查 per\_shape\_results 中是否存在 speedup 差异显著的 shape 子集
+- 如果以上条件均满足 → 涉及
+- 如果 speedup >= 0.8 或无显著差异的 shape 子集 → 不涉及，跳过
+
+**命中条件**：所有常规优化点已穷尽，且整体性能不达标（speedup < 0.8），且存在可挖掘的 shape 规律
+
+**参考文档**：`references/kernel_split.md`
+
 ---
 
 ## 优化流程
+
 ```
 1. 按顺序检查优化点 1 → 2 → 3 → ... → 12
 2. 对于当前优化点，先判断是否命中（代码特征满足 + 适用条件成立）：
@@ -427,16 +453,22 @@ kernel[grid](..., BLOCK_M=128, BLOCK_N=128)
 ```
 
 **重要约束**：
+
 - ⚠️ **只能使用本 skill 规定的优化方式，禁止使用任何超出本 skill 之外的优化方式**
 - ⚠️ **必须先命中优化点的「命中条件」，才能加载参考文档；未命中则跳过**
+- ⚠️ **优化点 13（Kernel 分裂优化）仅在优化点 1-12 全部穷尽后才能触发**，不得提前触发
 - 一次优化迭代只能使用一个优化点，可以有多轮优化，示例：
+
 ```
   第一轮：检查 1→2→3→...，命中优化点 X，应用后验证
   第二轮：检查 1→2→...，命中优化点 Y，应用后验证
   第三轮：检查 1→2→...，命中优化点 Z，应用后验证
   ...
+  第N轮：检查 1→2→...→12→13，命中优化点 13（Kernel 分裂），执行分裂流程
+  ...
   直到所有优化点都不命中
 ```
+
 - 一次只能参考一个文档
 
 ## 优化验证规则
@@ -466,4 +498,5 @@ kernel[grid](..., BLOCK_M=128, BLOCK_N=128)
 | 循环不变量外提 | `references/loop-invariant-hoisting.md` |
 | Load 指令重排序 | `references/load-order.md` |
 | Autotune 自动调优 | `references/autotune.md` |
+| Kernel 分裂优化 | `references/kernel_split.md` |
 | 代码规范检查 | `references/checklist.md` |

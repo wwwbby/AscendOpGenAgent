@@ -361,10 +361,16 @@ while True:
     ── 4.1 代码分析 + 优化策略 + 代码重写 ────────────
     调用 latency-optimizer skill
 
-    latency-optimizer 报告无更多优化点:
-      → 终止优化，进入 4.6 终局判定
+    latency-optimizer 命中某个优化点:
+      → 根据优化点进行代码优化重写
 
-    根据优化点进行代码优化重写
+    latency-optimizer 报告无更多优化点:
+      → 检查是否命中优化点 13（Kernel 分裂优化）
+      → 命中优化点 13（speedup < 0.8 且存在可分裂的 shape 规律）:
+          → 跳到 4.7（Kernel 分裂流程）
+      → 未命中优化点 13（speedup >= 0.8 或无有效规律）:
+          → 终止 Phase 4 优化，进入 4.6 终局判定
+
     产物 → {工作目录}/output/opt_iter_{opt_iteration}/optimized_code.py
 
     checklist 检查:
@@ -470,17 +476,178 @@ while True:
     无优化点时退出判定：
 
     improvement_made == true:
-      → 优化成功，break，进入 Phase 5
+      → 优化成功，break，进入 Phase 5（输出报告）
 
     improvement_made == false:
-      → 优化失败（做完所有尝试后没有效果），break，进入 Phase 5
+      → 优化失败（做完所有尝试后没有效果），break，进入 Phase 5（输出报告）
+
+    ── 4.7 Kernel 分裂（性能瓶颈 shape 自动拆分优化）──
+    当优化点 13 命中时进入此流程。
+
+    ⚠️ 仅在满足触发条件时执行：speedup_vs_torch < 0.8 且存在可分裂的 shape 规律。
+
+    状态变量：
+      split_iteration = 0
+      max_split_iterations = 3
+      split_history = []
+      final_kernel_map = {}
+
+    while split_iteration < max_split_iterations:
+
+        ── 4.7.1 收集性能瓶颈 shape ──────────────────
+        从最终 perf_result.json 的 per_shape_results 中提取所有 shape 的 speedup_vs_torch。
+
+        筛选条件：
+          speedup_vs_torch < 0.8 的 shape → 瓶颈 shape 列表 bottleneck_shapes
+
+        若 bottleneck_shapes 为空（所有 shape 均 ≥ 0.8 但几何平均 < 0.8）：
+          放宽筛选条件为 speedup_vs_torch < 几何平均值 → 重新收集
+
+        若仍为空 → 无法分裂，break，进入 Phase 5（输出报告）
+
+        计算正常 shape 的平均性能：
+          normal_speedup_avg = 非 bottleneck shape 的 speedup_vs_torch 算术平均
+
+        ── 4.7.2 规律挖掘 ────────────────────────────
+        对 bottleneck_shapes 逐个分析其 shape 特征，尝试归纳共性规律。
+        Agent 必须从 latency-optimizer skill 的 references/kernel_split.md 中
+        定义的规律挖掘维度逐一检查（共 20 个维度，不限于）。
+
+        对每个维度，Agent 应总结出候选规律，例如：
+          "reduce 轴为 axis=0 且 reduce 轴长度 > 4096 的 shape 性能差"
+          "总元素量 < 1024 的 shape 性能差"
+          "输入需要 permute 的 shape 性能差"
+          "shape 非 BLOCK_SIZE 整数倍导致 padding 开销大的 shape 性能差"
+          "多输入 shape 不一致需隐式广播的 shape 性能差"
+          "算术强度 < 1（memory-bound）的 shape 性能差"
+          "维度数 >= 4 且存在 size-1 维度的 shape 性能差"
+          "输入输出元素比 > 1024（高压缩比 reduce）的 shape 性能差"
+
+        ── 4.7.3 规律验证 ────────────────────────────
+        对每个候选规律，统计验证：
+
+        设 R 为某候选规律，定义：
+          R_shapes = 满足规律 R 的所有 shape
+          non_R_shapes = 不满足规律 R 的所有 shape
+
+        计算：
+          R_avg_speedup = R_shapes 的 speedup_vs_torch 算术平均
+          non_R_avg_speedup = non_R_shapes 的 speedup_vs_torch 算术平均
+
+        判定条件（需同时满足）：
+          1. R_avg_speedup < non_R_avg_speedup * 0.7
+             （满足规律的 shape 性能显著差于不满足的，至少差 30%）
+          2. len(R_shapes) >= 1
+             （至少有 1 个 shape 满足该规律）
+          3. len(non_R_shapes) >= 1
+             （至少有 1 个 shape 不满足该规律，确保分裂有意义）
+
+        通过验证的规律 → 有效规律，进入 4.7.4
+        无有效规律 → break，无法分裂，进入 Phase 5（输出报告）
+
+        若有多个有效规律，选择 R_avg_speedup 最低（性能最差）的那个作为本轮分裂依据。
+
+        ── 4.7.4 Kernel 分裂 ─────────────────────────
+        根据选定的有效规律 R，将 kernel 分裂为两个：
+
+        **通用 kernel（kernel_general）**：
+          - 处理不满足规律 R 的 shape
+          - 代码来源：当前最终代码（Phase 4 优化后或 Phase 3 基线），原样保留
+          - 保存为 {工作目录}/output/split_iter_{split_iteration}/kernel_general.py
+
+        **专用 kernel（kernel_specialized）**：
+          - 处理满足规律 R 的 shape
+          - 需要从头重新生成，针对规律 R 描述的 shape 特征进行专门优化
+          - 保存为 {工作目录}/output/split_iter_{split_iteration}/kernel_specialized.py
+
+        **生成专用 kernel**：
+          调用 kernel-generator skill，传入：
+            - op_name（加 _specialized 后缀）
+            - task_desc（原始任务文件）
+            - arch
+            - sketch（原始 sketch.txt）
+            - user_requirements 中追加：
+              "本 kernel 仅用于满足以下规律的 shape：{规律 R 的自然语言描述}。
+               请针对此规律进行优化设计，例如调整 BLOCK_SIZE、grid 配置、
+               内存访问模式等以适配该类 shape 特征。"
+            - previous_code: 当前最终代码（作为参考起点）
+
+        **构建 dispatch wrapper**：
+          创建 {工作目录}/output/split_iter_{split_iteration}/dispatch_wrapper.py，包含：
+            - 规律 R 的判定函数 `matches_pattern(input_shapes) -> bool`
+            - forward() 函数：根据判定结果选择调用 kernel_general 或 kernel_specialized
+            - 判定逻辑必须基于 shape 属性（维度、大小、stride 等），不得硬编码具体 shape 值
+
+        ── 4.7.5 验证分裂后代码 ────────────────────────
+        对 dispatch_wrapper.py 执行完整验证流程：
+
+        4.7.5.1 AST 预检查：
+          对 kernel_general.py 和 kernel_specialized.py 分别执行 validate_triton_impl.py
+          任一退化 → 修复后重试（最多 2 次），仍失败 → 放弃本轮分裂，split_iteration++，continue
+
+        4.7.5.2 功能验证：
+          调用 kernel-verifier skill (verify.py)，使用 dispatch_wrapper.py 作为 triton 实现
+          在 {工作目录}/output/split_iter_{split_iteration}/verify/ 下创建验证文件
+
+          验证通过 (passed_cases == total_cases):
+            → 继续 4.7.5.3
+          验证失败:
+            → 放弃本轮分裂，split_iteration++，continue
+
+        4.7.5.3 性能测试：
+          调用 kernel-verifier skill (benchmark.py)，测试 dispatch_wrapper.py 的整体性能
+
+          产物 → {工作目录}/output/split_iter_{split_iteration}/perf_result.json
+
+        ── 4.7.6 分裂效果判定 ──────────────────────────
+        读取 split_perf_result.json：
+
+        split_speedup = 分裂后的 speedup_vs_torch（几何平均）
+
+        同时检查瓶颈 shape 的改善情况：
+          bottleneck_shapes 在分裂后的 speedup 是否有提升
+          （从 per_shape_results 中提取满足规律 R 的 shape 的新 speedup）
+
+        判定：
+          split_speedup >= 0.8:
+            → 分裂成功！记录规律 R 和对应 kernel
+            → final_kernel_map[规律 R] = kernel_specialized.py 路径
+            → 更新最终代码为 dispatch_wrapper.py
+            → improvement_made = true
+            → break，进入 Phase 5（输出报告）
+
+          split_speedup >= final_speedup * 1.05（有 5% 以上提升）:
+            → 分裂有改善但未达标
+            → 记录本轮规律和结果
+            → split_history.append({规律 R, split_speedup, 改善的 shape 列表})
+            → 更新 final_speedup = split_speedup
+            → 更新最终代码为 dispatch_wrapper.py
+            → improvement_made = true
+            → 检查是否仍有 shape 的 speedup < 0.8
+              是 → split_iteration++，continue（尝试进一步分裂）
+              否 → break，进入 Phase 5（输出报告）
+
+          split_speedup < final_speedup * 1.05（无明显改善）:
+            → 分裂无效，放弃本轮
+            → split_iteration++，continue
+
+        ── 4.7.7 专用 kernel 优化（可选）────────────────
+        若分裂有改善但未达标（4.7.6 的第二种情况），可对 kernel_specialized.py
+        执行一轮 Phase 4 风格的优化（调用 latency-optimizer skill），
+        仅针对满足规律 R 的 shape 子集进行优化和验证。
+        优化后重新执行 4.7.5.2 ~ 4.7.6 的验证和判定流程。
+
+    达到 max_split_iterations → 以当前最佳结果进入 Phase 5（输出报告）
 ```
 
 ### Phase 4 终局处理
 
-- Phase 4 优化成功（improvement_made == true）→ 以 `optimized_code.py` 为最终结果
-- Phase 4 优化失败（improvement_made == false，做完所有尝试后没有效果）→ 以 Phase 3 的 `generated_code.py` 为最终结果
-- 两种情况都进入 Phase 5
+- Phase 4 常规优化成功（improvement_made == true，未触发 Kernel 分裂）→ 以 `optimized_code.py` 为最终结果
+- Phase 4 常规优化失败（improvement_made == false）→ 以 Phase 3 的 `generated_code.py` 为最终结果
+- Phase 4 触发 Kernel 分裂且分裂成功 → 以 `dispatch_wrapper.py` 为最终结果
+- Phase 4 触发 Kernel 分裂且有改善但未达标 → 以最佳 `dispatch_wrapper.py` 为最终结果
+- Phase 4 触发 Kernel 分裂但分裂无效 → 以分裂前的最佳代码为最终结果
+- 所有情况都进入 Phase 5（输出报告）
 
 ---
 
@@ -488,14 +655,21 @@ while True:
 
 **选择最终代码**：
 
-- Phase 4 成功 → `optimized_code.py`
-- Phase 4 失败 → Phase 3 的 `generated_code.py`
+- Phase 4 触发 Kernel 分裂且分裂成功 → `dispatch_wrapper.py`（包含通用 kernel + 专用 kernel + 分发逻辑）
+- Phase 4 触发 Kernel 分裂且有改善但未达标 → 最佳 `dispatch_wrapper.py`
+- Phase 4 未触发 Kernel 分裂且优化成功 → `optimized_code.py`
+- Phase 4 未触发 Kernel 分裂且优化失败 → Phase 3 的 `generated_code.py`
 
 复制最终代码到 `{工作目录}/{op_name}_generated.py`。
 
 **写入 `{工作目录}/report.md`**：
 - 基本信息：arch、工作目录
 - 生成结果：迭代次数、最终版本来源
+- **Kernel 分裂信息**（若 Phase 4 执行了 Kernel 分裂）：
+  - 是否触发分裂、分裂轮次
+  - 发现的有效规律及对应 shape 特征
+  - 分裂前后整体 speedup 对比
+  - 通用 kernel 和专用 kernel 的路径
 - **Shape 通过率（以 verify 为准）**：`passed_cases / total_cases` 必须从
   `output/iter_{phase3_last_iter}/verify/verify_result.json` 读取。
   ⚠️ **禁止**从 `perf_result.json` 取 passed_cases —— 后者是"benchmark exec 成功数"
@@ -532,6 +706,9 @@ while True:
   "gen_iterations": 2,
   "opt_iterations": 1,
   "optimized": true,
+  "kernel_split": {
+    "triggered": false
+  },
   "perf_method": "profiler",
   "skill_path": ".claude/skills/kernel-verifier",
   "perf_data": {
@@ -560,6 +737,34 @@ while True:
 - `speedup_vs_baseline`: Phase 4 时 = `optimized.speedup_vs_torch / baseline.speedup_vs_torch`（两个几何平均之比）
 - `passed_cases` / `failed_cases`: 多 shape 时的通过 / 失败计数（策略 A 成功时应为 total / 0）
 - `*_indices`: 五类异常 `s_i` 的 case_idx 列表，无异常时为 `[]`
+
+**Kernel 分裂扩展格式**（Phase 4 Kernel 分裂触发时，向后兼容）：
+```json
+{
+  "success": true,
+  "gen_iterations": 2,
+  "opt_iterations": 1,
+  "optimized": true,
+  "kernel_split": {
+    "triggered": true,
+    "split_iterations": 1,
+    "split_rules": [
+      {
+        "rule": "reduce 轴为 axis=0 且轴长度 > 4096",
+        "avg_speedup_before": 0.55,
+        "avg_speedup_after": 0.92,
+        "bottleneck_shapes_count": 3
+      }
+    ],
+    "final_kernel": "dispatch_wrapper.py",
+    "speedup_before_split": 0.55,
+    "speedup_after_split": 0.92
+  },
+  "perf_method": "profiler",
+  "skill_path": ".claude/skills/kernel-verifier",
+  "perf_data": { ... }
+}
+```
 
 **GPU Kernel 模式扩展格式**（向后兼容）：
 ```json
@@ -689,6 +894,13 @@ ${pwd}/triton_ascend_output/op_{op_name}_{timestamp}_{rid}/
 │   │   └── log.md
 │   └── opt_iter_1/                       # Phase 4 第 1 轮（如有）
 │       └── ...
+├── split_iter_0/                         # Phase 4 Kernel 分裂第 0 轮（如有）
+│   ├── kernel_general.py                 # 通用 kernel
+│   ├── kernel_specialized.py             # 专用 kernel
+│   ├── dispatch_wrapper.py               # 分发 wrapper
+│   ├── verify/                           # 验证结果
+│   ├── perf_result.json                  # 性能结果
+│   └── log.md                            # 分裂日志
 ├── {op_name}_generated.py                # Phase 5: 最终代码
 ├── summary.json                          # 执行摘要
 └── report.md                             # 最终报告
@@ -734,6 +946,7 @@ agent 收到 exit 2 时，必须按下表把它**等价映射**到对应 verify 
 | Phase 4 迭代策略 | 不做最大迭代次数限制，直到 latency-optimizer 报告无更多优化点则退出 |
 | Phase 4 成功底线 | 性能不劣化（speedup_vs_baseline ≥ 1.0） |
 | Phase 4 退出判定 | 有效果（speedup_vs_baseline ≥ 1.0）则成功；做完所有尝试后无效果则失败 |
+| Phase 4 Kernel 分裂 | 优化点 13 命中时触发，最多 3 轮分裂迭代；规律验证需 R_avg_speedup < non_R_avg_speedup * 0.7 |
 | Phase 4 基线复用 | 4.2/4.3 的基线侧 verify_result_baseline.json 和 baseline_perf_result.json 必须从 Phase 3 iter_{phase3_last_iter} 复制，禁止对基线代码重跑 verify.py 或 benchmark.py（基线代码与 Phase 3 generated_code.py 完全一致，重复执行只浪费时间） |
 | A 类连续上限 | 同一子类型连续 ≥ 3 次 → 自动终止 |
 | 禁止 PyTorch 退化 | forward() 中禁止 torch.*/F.* 计算操作 |
