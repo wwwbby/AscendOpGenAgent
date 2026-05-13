@@ -758,6 +758,100 @@ export TRITON_PRINT_AUTOTUNING=1
 
 ---
 
+### 常见问题5：配置autotune的参数范围较广，导致失败
+
+当 autotune 的某些 config 在特定 shape 下会触发运行时错误（如共享内存不足、资源溢出等），导致 kernel 执行直接被终止时，可以通过 `early_config_prune` 在 benchmark 之前将可能出问题的 config 过滤掉，避免运行时异常。
+
+**典型场景：** `BLOCK_SIZE=4096` 在小 shape 上可能超出硬件资源限制导致报错，希望 autotune 仅在 `[512, 1024, 2048]` 上尝试，4096 在不合适的 shape 下被自动跳过而非终止整个 kernel。
+
+**示例 1：基于数据量大小剪枝**
+
+```python
+def early_config_prune(configs, named_args, **kwargs):
+    pruned = []
+    n_elements = named_args.get('n_elements', float('inf'))
+    for config in configs:
+        block_size = config.kwargs.get('BLOCK_SIZE', 0)
+        # BLOCK_SIZE 不应远大于数据量，否则会触发资源不足错误
+        if block_size > n_elements:
+            continue
+        pruned.append(config)
+    return pruned
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 512}),
+        triton.Config({'BLOCK_SIZE': 1024}),
+        triton.Config({'BLOCK_SIZE': 2048}),
+        triton.Config({'BLOCK_SIZE': 4096}),
+    ],
+    key=['n_elements'],
+    prune_configs_by={
+        'early_config_prune': early_config_prune,
+    },
+)
+@triton.jit
+def my_kernel(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    tl.store(x_ptr + offs, x, mask=mask)
+```
+
+**示例 2：基于硬件资源限制剪枝（GEMM 场景）**
+
+参考 PyTorch Inductor 中 `mm_grouped` 的实现，根据共享内存、问题规模、warp specialization 等约束进行多层剪枝：
+
+```python
+def early_config_prune(configs, named_args, **kwargs):
+    pruned = []
+    M = named_args.get('M', 1)
+    N = named_args.get('N', 1)
+    K = named_args.get('K', 1)
+    for config in configs:
+        BLOCK_M = config.kwargs.get('BLOCK_M', 128)
+        BLOCK_N = config.kwargs.get('BLOCK_N', 128)
+        BLOCK_K = config.kwargs.get('BLOCK_K', 64)
+
+        # 1. 基于问题规模剪枝：M 较小时不需要过大的 BLOCK_M
+        if M <= 16 and BLOCK_M > 32:
+            continue
+        elif M <= 32 and BLOCK_M > 64:
+            continue
+
+        # 2. 基于共享内存限制剪枝
+        # max_shared_memory = get_device_shared_memory()
+        # required = (BLOCK_M + BLOCK_N) * BLOCK_K * num_stages * dtype_size
+        # if required > max_shared_memory:
+        #     continue
+
+        pruned.append(config)
+    return pruned
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16, 'BLOCK_K': 32}),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 64}),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 256}),
+    ],
+    key=['M', 'N', 'K'],
+    prune_configs_by={
+        'early_config_prune': early_config_prune,
+    },
+)
+@triton.jit
+def matmul_kernel(...):
+    ...
+```
+
+**核心原则：**
+- `early_config_prune` 在 autotune 开始 benchmark **之前**被调用，不会触发任何 kernel 执行错误
+- 剪枝函数必须返回至少一个 config，否则 autotune 会报错
+- 可以根据 `named_args` 中的 shape 信息（元素数量、维度大小等）判断哪些 config 可能有问题
+- 常见剪枝依据：数据量大小、共享内存限制、寄存器压力、问题规模与 BLOCK_SIZE 的比例关系
+
 ### 问题快速排查表
 
 | 现象                              | 可能的原因                       | 建议动作                      |
@@ -766,6 +860,7 @@ export TRITON_PRINT_AUTOTUNING=1
 | parser 能识别一部分，但总差一个参数           | 某个参数没有和轴长度 mask 建立联系         | 改 DSL 写法或改手写 config      |
 | kernel 完全没有合适的 tl.constexpr 可调项 | DSL 没暴露调参接口                  | 先改 kernel dsl，再谈 autotune |
 | 自动生成能跑，但候选质量明显差                 | 当前算法不适合该 kernel 的参数耦合方式      | 手动构造 config 传入      |
+| 在个别输入用例编译报错    | 配置autotune的参数范围较广，某些用例需要剔除      | 通过 `early_config_prune` 在 benchmark 之前将可能出问题的 config 过滤掉，避免运行时异常      |
 
 ---
 
