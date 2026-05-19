@@ -134,11 +134,36 @@ python3 -c "import datetime,random; ts=datetime.datetime.now().strftime('%Y%m%d_
 
 ## Phase 2: 算法设计
 
+---
+
+### Phase 2.0：知识库检索确认（强制）
+
+在调用 kernel-designer 之前，确认以下三项全部满足，任一未满足则重新触发 codegen_init 检索：
+- [ ] 3rdparty/triton-ascend-kkb/cache/codegen_init__*.md 已写入（新建或命中）
+- [ ] 3rdparty/triton-ascend-kkb/cache/README.md §5 §6 已更新
+- [ ] 缓存精确命中时 F4 事件已写入 3rdparty/triton-ascend-kkb/log.md
+
+#### Phase 2.0 检索摘要终端输出（强制）
+
+完成检索确认后，必须在终端输出以下摘要（不可省略）：
+
+```
+┌─ KKB 检索摘要 [Phase 2.0 codegen_init] ──────────────
+│ 命中状态: <精确命中 / 相似命中(N/M关键词) / 全新检索>
+│ 缓存文件: 3rdparty/triton-ascend-kkb/cache/<filename>.md
+│ Top 知识单元: <top_units 列表，3-5条>
+│ 应用策略: <直接复用 / 增量检索后合并 / 完整七步检索>
+│ F4 事件: <已写入 / 不适用(非精确命中)>
+└──────────────────────────────────────────────────────
+```
+
 调用 `kernel-designer` skill，设计算法草图。
 
-**传入**：`op_name`、`task_desc`（任务文件完整内容）、`arch`、`user_requirements`（如有）。
+**传入**：`op_name`、`task_desc`（任务文件完整内容）、`arch`、`user_requirements`（如有）、`kkb_cache_path`（Phase 2.0 产出的缓存文件路径）。
 
 **产出**：`{工作目录}/sketch.txt`。
+
+⚠️ codegen_init 检索已在 Phase 2.0 由主 Agent 完成，kernel-designer 直接消费 `kkb_cache_path` 中的知识单元，禁止重复执行七步检索。
 
 仅执行一次，后续 Phase 3 迭代不再重新设计草图。
 
@@ -218,11 +243,81 @@ while iteration < max_iterations:
     ── 3.4 Conductor 分析与决策 ──────────────────────
     (Agent 自身推理，非 Skill 调用)
 
-    错误分类:
+    ⚠️ **进入 3.4 时，必须立即输出以下"Conductor 入口确认"，禁止跳过。**
+    此输出的目的是强制 Agent 在修复代码之前先声明错误类别和检索决策，
+    防止 Agent 凭直觉直接修复而绕过知识库检索。
+
+    ### Conductor 入口确认（强制终端输出，3.4 的第一步）
+
+    每次进入 3.4 时，**必须首先输出以下摘要，然后才能进行任何分析或修复**：
+
+    ```
+    ┌─ Conductor 入口确认 [iter_<N>] ─────────────────────
+    │ 失败阶段: <AST预检查 / 编译 / 精度验证>
+    │ 错误摘要: <一句话描述错误，≤50字>
+    │ 错误类别判定: <编译失败 / 精度失败 / 结构性错误>
+    │ 检索决策: <需要 compile_error 检索 / 需要 precision_debug 检索 / 跳过(结构性错误)>
+    │ 检索理由: <为什么需要/不需要检索，≤30字>
+    └──────────────────────────────────────────────────────
+    ```
+
+    **判定规则**：
+    - 失败阶段 = AST预检查 且 regression_type ∈ {1,2,3} → 错误类别 = 结构性错误 → 检索决策 = 跳过
+    - 失败阶段 = 编译 → 错误类别 = 编译失败 → 检索决策 = **需要 compile_error 检索**
+    - 失败阶段 = 精度验证 → 错误类别 = 精度失败 → 检索决策 = **需要 precision_debug 检索**
+
+    **禁止行为**：
+    - 禁止在输出"Conductor 入口确认"之前开始分析错误原因
+    - 禁止在检索决策 = "需要检索" 时跳过检索直接修复
+    - 禁止将"我已经知道怎么修"作为跳过检索的理由
+
+    输出入口确认后，按检索决策执行步骤 0。
+
+    ---
+
+    ## Conductor 知识库预检索（每轮失败后，必须最先执行）
+
+    步骤 0：知识库预检索（禁止跳过）
+      编译失败（ImportError / SyntaxError / APIError / UB overflow / cbuf overflow）：
+        → 发送 compile_error 检索请求（3rdparty/triton-ascend-kkb/integration.md §3）
+        → 写入 F1(fail) 事件到 3rdparty/triton-ascend-kkb/log.md
+        → 获得 kkb_hints 后才能继续
+      精度验证失败（max_err超标 / cosine_sim<0.999 / NaN / inf / 相对误差超标）：
+        → 发送 precision_debug 检索请求（3rdparty/triton-ascend-kkb/integration.md §3）
+        → 写入 F2(fail) 事件到 3rdparty/triton-ascend-kkb/log.md
+        → 获得 kkb_hints 后才能继续
+      结构性错误（PyTorch 退化等）：
+        → 跳过检索，直接进入步骤 1
+      ⚠️ 禁止在未完成步骤 0 的情况下进入步骤 1
+
+    ### Phase 3.4 步骤 0 强制校验清单（每轮失败后必须逐项确认）
+    - [ ] 已判定错误类别（编译失败 / 精度失败 / 结构性错误）
+    - [ ] Conductor 入口确认已输出到终端
+    - [ ] compile_error 或 precision_debug 检索请求已发送（结构性错误除外）
+    - [ ] F1(fail) 或 F2(fail) 事件已写入 log.md（结构性错误除外）
+    - [ ] kkb_hints 已获得并将纳入 conductor_suggestion（结构性错误除外）
+    任一未满足（结构性错误除外）则禁止进入步骤 1。
+
+    ### Phase 3.4 检索摘要终端输出（强制，步骤 0 完成后输出）
+    ```
+    ┌─ KKB 检索摘要 [Phase 3.4 <compile_error|precision_debug>] ───
+    │ 错误类别: <编译失败 / 精度失败 / 结构性错误>
+    │ 命中状态: <精确命中 / 相似命中 / 全新检索 / 跳过(结构性错误)>
+    │ 缓存文件: <文件路径 / 无>
+    │ Top 修复建议: <kkb_hints 中的 Top-3 知识单元>
+    │ 事件记录: <F1(fail) / F2(fail) / 无>
+    └─────────────────────────────────────────────────────────
+    ```
+
+    步骤 1：错误分类:
       A 类 — 代码逻辑/算法错误 (可修复)
         含 A-PyTorchFallback-Type1/2/3 子类型
       B 类 — 环境/基础设施错误 (不可修复)
       C 类 — 重复失败: 同一 A 类子类型连续 ≥ 3 次
+
+    步骤 2：生成修复建议
+      → 必须将 kkb_hints 中的修复建议纳入 conductor_suggestion
+      → 将 conductor_suggestion（含 kkb_hints）传给下一轮 kernel-generator
 
     决策:
       B 类 → 终止，任务失败
@@ -272,6 +367,36 @@ while iteration < max_iterations:
 
 达到 max_iterations → 任务失败，输出失败报告，结束
 ```
+
+---
+
+## Phase 3.1: 知识摄入 + 定期维护
+
+### 知识摄入触发条件（参考 3rdparty/triton-ascend-kkb/integration.md §5）：
+
+- **Source B**：精度通过 + speedup ≥ 1.1x + ≥1 轮有效 profiling → 写入到 3rdparty/triton-ascend-kkb/raw/experiences/<cat>/
+- **Source C**：F1/F2 fail→success/pass 事件对 → 写入到 3rdparty/triton-ascend-kkb/raw/experiences/general_debug/
+- **Source D**：F3 瓶颈偏差 > 20% → 写入到 3rdparty/triton-ascend-kkb/raw/experiences/general_perf/
+- 所有摄入完成后写入 INGESTION 事件到 3rdparty/triton-ascend-kkb/log.md
+
+### 定期维护触发：
+统计 3rdparty/triton-ascend-kkb/log.md 中 F3 总数 N，当 N > 0 且 N mod 10 == 0 时，执行 3rdparty/triton-ascend-kkb/maintenance/periodic_tasks.md 中的维护任务。
+
+### Phase 3.1 完成确认（强制终端输出）
+
+所有摄入和维护操作完成后，必须在终端输出摘要：
+
+```
+┌─ KKB 知识摄入 [Phase 3.1] ─────────────────────────────
+│ Source B: <已写入 <path> / 未触发>
+│ Source C: <已写入 <path> / 未触发>
+│ Source D: <已写入 <path> / 未触发>
+│ INGESTION 事件: <已写入 log.md / 无摄入>
+│ 定期维护: <已执行 Task 1-4 / 未触发 (F3总数=<N>)>
+└────────────────────────────────────────────────────
+```
+
+---
 
 ### Conductor 修复建议格式
 
@@ -357,6 +482,28 @@ improvement_made = false
 
 ```
 while True:
+
+    ── 4.0 知识库检索确认（每轮优化前，强制执行） ──────
+
+    latency-optimizer 在瓶颈分析后需发送 perf_tuning 检索。
+    主 Agent 在调用 latency-optimizer 前确认以下条件：
+
+    ### Phase Phase 3.9 强制校验清单
+    - [ ] 上一轮（或首轮基线）perf_result.json 已读取，瓶颈类型已识别
+    - [ ] perf_tuning 检索请求已发送（无明显瓶颈时标注"跳过"并继续）
+    - [ ] 检索结果中 Top-3 P2 级知识单元已注入 latency-optimizer 的输入
+    - [ ] 缓存精确命中时 F4 事件已写入 log.md
+
+    ### Phase 3.9 检索摘要终端输出（强制）
+    ```
+    ┌─ KKB 检索摘要 [Phase 3.9 perf_tuning] ──────────────
+    │ 瓶颈类型: <CubeUtil_low / MTE2_high / VecUtil_low / 无明显瓶颈>
+    │ 命中状态: <精确命中 / 相似命中 / 全新检索 / 跳过(无瓶颈)>
+    │ 缓存文件: <文件路径 / 无>
+    │ Top-3 调优经验: <知识单元 ID 和核心技术>
+    │ F4 事件: <已写入 / 不适用>
+    └────────────────────────────────────────────────────
+    ```
 
     ── 4.1 代码分析 + 优化策略 + 代码重写 ────────────
     调用 latency-optimizer skill
@@ -510,6 +657,60 @@ while True:
   `per_shape_results` 里取该 shape 的 framework / implementation / speedup（保留 4 位小数）；
   失败 shape 在表格中以 `status=fail` 行展示并附 `error_type`，不填延时。
 - 代码路径：`{op_name}_generated.py`
+- **知识库检索贡献分析**（必须输出，作为对知识库的反馈）
+
+**知识库检索贡献分析格式**（写入 report.md 的 `## 知识库检索对正确性和性能的贡献分析` 章节）：
+
+```markdown
+## 知识库检索对正确性和性能的贡献分析
+
+### 一、对正确性的贡献
+
+#### 1. 架构设计决策
+回顾 codegen_init 检索中哪些知识单元影响了 kernel 的架构决策（grid 设计、内存布局、
+边界处理等），评估如果没有这些知识单元可能需要额外多少轮探索。
+
+#### 2. 参考代码的作用
+分析经验代码片段（E 系列知识单元引用的 extracted_kernels）对实现正确性的贡献，
+包括提供了哪些正确的实现模式。
+
+#### 3. 调试过程中的贡献
+分析 Phase 3 迭代修复过程中知识库的实际帮助：
+- 哪些轮次的错误可以被知识库现有知识预防？
+- 哪些轮次的错误暴露了知识库的盲区？
+
+#### 4. 正确性贡献量化评估表
+
+| 贡献类型 | 知识单元 | 避免的问题 | 估计节省的调试轮次 |
+|---------|---------|-----------|----------------|
+| ... | ... | ... | ... |
+| **未覆盖** | ... | 未能避免的问题 | 0轮（未帮助） |
+
+### 二、对性能的贡献
+
+#### 1. Phase 3 基线性能
+分析哪些知识单元对首版 kernel 达到的加速比有贡献（算法模式选择、API 用法等）。
+
+#### 2. Phase 4 优化性能
+分析 Phase 4 优化中哪些策略来自知识库检索，量化每个优化点的贡献度。
+
+#### 3. 性能贡献量化评估表
+
+| 知识单元 | 优化方向 | Phase | 实际贡献 | 加速比贡献 |
+|---------|---------|-------|---------|-----------|
+| ... | ... | ... | ... | ... |
+
+### 三、总体评价与改进建议
+
+#### 知识库的核心价值
+概括知识库在本次任务中的 2-3 个核心贡献点。
+
+#### 知识库的不足与改进建议
+列出本次任务中暴露的知识库盲区，以及建议补充的知识单元类型。
+```
+
+⚠️ 此分析必须基于实际发生的事实（检索了哪些知识单元、哪些被使用、哪些未命中），
+禁止虚构贡献。对于知识库未能帮助的部分，如实标注"未覆盖"。
 
 **写入 `{工作目录}/summary.json`**：
 

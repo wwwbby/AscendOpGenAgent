@@ -93,6 +93,32 @@ argument-hint: >
 
 ---
 
+## 知识消费流程（必须最先执行）
+
+在开始设计草图之前，必须完成以下知识加载步骤：
+
+⚠️ **codegen_init 检索已由主 Agent Phase 2.0 完成**，本 Skill 禁止重复执行七步检索或缓存命中检查。
+
+1. **加载检索缓存**：读取主 Agent 传入的 `kkb_cache_path`（即 `3rdparty/triton-ascend-kkb/cache/codegen_init__<op_name>_<dtype>.md`），获取完整的知识单元列表。
+
+2. **若 kkb_cache_path 未传入或文件不存在**：
+   → 向主 Agent 报错："codegen_init 缓存未找到，请确认 Phase 2.0 已完成"
+   → 禁止自行执行检索，等待主 Agent 重新执行 Phase 2.0
+
+3. **知识单元注入**：将缓存中的 C/OP/A/B/E/T/S 知识单元注入到算法草图中，使用 `@llm_hint` 标注对应的经验 ID。
+
+4. **终端输出确认（强制）**：
+```
+┌─ kernel-designer 知识加载 ─────────────────────────
+│ 缓存文件: <kkb_cache_path>
+│ 知识单元总数: <N>
+│ 关键经验: <E系列 Top-3 经验ID>
+│ 关键约束: <C系列适用约束>
+└────────────────────────────────────────────────────
+```
+
+---
+
 ## 设计模式
 
 1. 仔细阅读 `task_desc` 中 `Model.forward()` 的参考实现

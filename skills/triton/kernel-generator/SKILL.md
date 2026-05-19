@@ -279,6 +279,32 @@ class ModelNew(nn.Module):
 - 遵循 Triton Ascend 的最佳实践
 - 针对 Ascend NPU 架构进行优化
 - 正确处理边界情况和异常条件
+
+---
+
+## 知识接入协议（必须遵守）
+
+1. 编译失败 / 精度失败：
+   → 检索已由主 Agent Conductor 层完成
+   → conductor_suggestion 中已包含 kkb_hints，直接使用，无需重复检索
+   → **禁止在未收到 kkb_hints 的情况下自行修复代码**（结构性错误如 PyTorch 退化除外）
+
+2. Profiling 瓶颈分析完成后（每轮迭代）：
+   → 发送 perf_tuning 检索请求（3rdparty/triton-ascend-kkb/integration.md §2）
+   → 将 Top-3 经验追加为 P2 级知识单元（不替换原有 P0/P1）
+
+3. 所有内部迭代完成后：
+   → 写入 F3 事件到 3rdparty/triton-ascend-kkb/log.md
+   → F3 必须包含 high_impact_units 和 low_impact_units
+
+4. 编译/精度修复成功后：
+   → F1(success) / F2(pass) 事件由主 Agent 统一写入（Phase 3 验证通过时）
+   → kernel-generator 无需自行写入 F1(success)/F2(pass)
+
+5. 用户否定某知识单元时：
+   → 写入 F5 事件到 3rdparty/triton-ascend-kkb/log.md
+
+所有事件 append 写入，不覆盖已有内容。
 - 包含必要的导入和包装函数
 - 数值正确性优先，性能次之
 - **严格遵守禁止 PyTorch 退化的约束** — 所有核心计算必须在 @triton.jit kernel 中实现
