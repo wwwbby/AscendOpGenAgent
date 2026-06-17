@@ -6,17 +6,18 @@ import os
 class Model(nn.Module):
     """
     Extended ELU backward.
+    Modified: bf16 also promoted to fp32 for computation.
     """
     def __init__(self):
         super(Model, self).__init__()
 
     def forward(self, grad_output: torch.Tensor, alpha: float, scale: float, input_scale: float, is_result: bool, self_or_result: torch.Tensor) -> torch.Tensor:
-        # 保存原始dtype，如果输入是fp16，转为fp32计算以提升精度
+        # 保存原始dtype，fp16和bf16都转为fp32计算以提升精度
         orig_dtype = grad_output.dtype
-        if orig_dtype == torch.float16:
+        if orig_dtype == torch.float16 or orig_dtype == torch.bfloat16:
             grad_output = grad_output.float()
             self_or_result = self_or_result.float()
-        
+
         mask = self_or_result <= 0
         if is_result:
             factor = torch.where(mask, input_scale * (self_or_result + alpha * scale), scale)
@@ -25,9 +26,9 @@ class Model(nn.Module):
             tmp = torch.exp(self_or_result * input_scale)
             factor = torch.where(mask, input_scale * alpha * scale * tmp, scale)
             result = grad_output * factor
-        
+
         # 转回原始dtype
-        if orig_dtype == torch.float16:
+        if orig_dtype == torch.float16 or orig_dtype == torch.bfloat16:
             result = result.to(orig_dtype)
         return result
 
