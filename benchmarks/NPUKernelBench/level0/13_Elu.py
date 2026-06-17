@@ -5,35 +5,29 @@ import os
 
 class Model(nn.Module):
     """
-    Simple model that applies Extended ELU activation.
-    ELU(x) = scale * x                    if x > 0
-             alpha * scale * (exp(input_scale * x) - 1)  if x <= 0
+    Extended ELU activation - unified float32 intermediate computation path
+    for all dtypes to match Triton Ascend behavior.
     """
     def __init__(self):
         super(Model, self).__init__()
 
-    def forward(self, x: torch.Tensor, alpha: float = 1.0, scale: float = 1.0, input_scale: float = 1.0) -> torch.Tensor:
-        """
-        Applies Extended ELU activation.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            alpha (float, optional): Alpha parameter. Default: 1.0.
-            scale (float, optional): Scale parameter. Default: 1.0.
-            input_scale (float, optional): Input scale parameter. Default: 1.0.
-
-        Returns:
-            torch.Tensor: Output tensor.
-        """
-        alpha_t = torch.as_tensor(alpha, dtype=x.dtype, device=x.device)
-        scale_t = torch.as_tensor(scale, dtype=x.dtype, device=x.device)
-        input_scale_t = torch.as_tensor(input_scale, dtype=x.dtype, device=x.device)
-
-        return torch.where(
-            x > 0,
-            scale_t * x,
-            alpha_t * scale_t * (torch.exp(input_scale_t * x) - 1)
+    def forward(self, x, alpha=1.0, scale=1.0, input_scale=1.0):
+        # Unified high-precision path: all dtypes use float32 intermediate
+        x_f32 = x.float()
+        alpha_f32 = torch.tensor(alpha, dtype=torch.float32, device=x.device)
+        scale_f32 = torch.tensor(scale, dtype=torch.float32, device=x.device)
+        input_scale_f32 = torch.tensor(input_scale, dtype=torch.float32, device=x.device)
+        # Clamp exp argument to avoid overflow
+        z = input_scale_f32 * x_f32
+        z = torch.clamp(z, min=-11.0, max=11.0)
+        result_f32 = torch.where(
+            x_f32 > 0,
+            scale_f32 * x_f32,
+            alpha_f32 * scale_f32 * (torch.exp(z) - 1)
         )
+        # Clamp to float16 max to avoid +Inf when converting back
+        result_f32 = torch.clamp(result_f32, min=-65504.0, max=65504.0)
+        return result_f32.to(x.dtype)
 
 
 def get_input_groups():
