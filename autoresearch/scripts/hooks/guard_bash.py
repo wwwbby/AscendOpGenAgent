@@ -23,7 +23,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hooks.utils import read_hook_input, block_decision, block_with_guidance
 from phase_machine import (
-    DIAGNOSE, DIAGNOSE_ATTEMPTS_CAP, EDIT, REPLAN, read_phase,
+    DIAGNOSE, DIAGNOSE_ATTEMPTS_CAP, EDIT, PLAN, REPLAN, read_phase,
     get_task_dir, touch_heartbeat, check_bash, parse_script_names,
     diagnose_state, parse_invoked_ar_script, load_state,
     is_single_foreground_ar_invocation,
@@ -83,6 +83,36 @@ _LIBRARY_NOT_CLI = {
 # `hallucinated_scripts`; loaded lazily so the config can be hot-edited.
 
 
+def _create_plan_has_second_arg(command: str) -> bool:
+    """Check if a create_plan.py invocation provides a second positional arg
+    (the XML payload, an @path, or '-' for stdin). create_plan.py takes
+    positional args only: <task_dir> [<items_xml>]. Returns True if the
+    command appears to have more than one positional arg after the script."""
+    import shlex
+    try:
+        tokens = shlex.split(command, posix=True, comments=False)
+    except ValueError:
+        return False
+    # Find the script token index
+    script_idx = None
+    for i, tok in enumerate(tokens):
+        norm = tok.replace("\\", "/")
+        if "scripts/" in norm and "create_plan.py" in norm:
+            script_idx = i
+            break
+    if script_idx is None:
+        return False
+    # Tokens after the script, excluding FD redirections
+    after_script = []
+    for tok in tokens[script_idx + 1:]:
+        if tok in ("2>&1", "1>&2") or tok.startswith(">") or tok.startswith("<"):
+            continue
+        after_script.append(tok)
+    # create_plan.py has no flags — everything after script path is positional.
+    # len >= 2 means task_dir + xml_payload both present.
+    return len(after_script) >= 2
+
+
 def _script_name_check(command: str):
     """Flag unknown / hallucinated autoresearch/scripts/*.py names before
     they reach the phase rule — gives a clearer message than 'not allowed'.
@@ -127,6 +157,30 @@ def main():
 
     phase = read_phase(task_dir)
     invoked = parse_invoked_ar_script(command)
+
+    # create_plan.py XML-input gate: the preferred single-arg form reads
+    # .ar_state/plan_items.xml by default. If that file doesn't exist AND
+    # the command doesn't supply a second arg (explicit XML / @path / stdin),
+    # create_plan.py will exit with a "missing XML" error. Intercept here
+    # so the LLM gets a clear instruction instead of a cryptic script error.
+    # When a second arg IS given, the XML may come from elsewhere (stdin,
+    # @path, inline) — don't block those, they're valid fallback forms.
+    if invoked == "create_plan.py" and phase in (PLAN, DIAGNOSE, REPLAN, EDIT):
+        from phase_machine import PLAN_ITEMS_FILE, state_path as _state_path
+        xml_path = _state_path(task_dir, PLAN_ITEMS_FILE)
+        if not os.path.exists(xml_path):
+            # Check whether the command supplies a second argument to
+            # create_plan.py (after the task_dir). If it does, the caller
+            # is providing XML via an alternative channel — allow it.
+            _has_second_arg = _create_plan_has_second_arg(command)
+            if not _has_second_arg:
+                from phase_machine import get_guidance
+                block_decision(
+                    f"[AR] create_plan.py blocked: .ar_state/{PLAN_ITEMS_FILE} "
+                    f"does not exist yet. Write your <items>...</items> XML "
+                    f"to that path using the Write tool FIRST, then re-run "
+                    f"create_plan.py.\n{get_guidance(task_dir)}"
+                )
 
     # DIAGNOSE-specific Bash gate: create_plan.py must come AFTER the
     # subagent artifact validates — UNLESS the subagent attempts cap has
