@@ -1,12 +1,27 @@
 #!/usr/bin/env python3
-"""
-Task directory scaffolder for Claude Code autoresearch (new workflow).
+"""Task directory scaffolder for Claude Code autoresearch (new workflow).
 
-Zero external dependency. Creates a self-contained task directory with:
+Two modes:
+
+  Default (copy mode):  creates a self-contained task directory under
+    `--output-dir` (default ./ar_tasks/) with copies of kernel + test +
+    perf + matching data files. The agent edits the copies; the user's
+    original files stay untouched.
+
+  In-place mode (`--task-dir <existing_dir>`):  adopts the user's
+    directory verbatim — writes only `.ar_state/`, `task.yaml`, and a
+    git baseline commit there. kernel / test / perf are NOT copied;
+    `editable_files` / `test_file` / `perf_file` reference the user's
+    original filenames. The agent edits the user's original kernel
+    in-place. Useful when the kernel/test/perf live in a separate
+    project repo (e.g. dsa_triton_ascend/) and the user wants AR's
+    optimisation commits to land there directly.
+
+Both modes end with:
   - task.yaml (config)
-  - kernel.py (editable seed; written from the user's --kernel file)
-  - <test_file> (python correctness script; user-supplied)
-  - <perf_file> (perf script printing triton/cann timing; user-supplied)
+  - <kernel_file> (editable seed)
+  - <test_file> (python correctness script)
+  - <perf_file> (perf script printing triton/cann timing)
   - .ar_state/ (progress tracking)
   - .git/ (baseline commit)
 
@@ -17,7 +32,14 @@ and prints `... passed!` per case), and a perf script that prints
 `triton:  median=X.XXms` + `cann:    median=X.XXms`.
 
 Usage:
-    python scripts/scaffold.py --kernel kernel.py --test test_op.py --perf perf_op.py --op-name my_op --devices <DEV>
+    # copy mode (default)
+    python scripts/scaffold.py --kernel k.py --test t.py --perf p.py \
+        --op-name my_op --devices 0
+
+    # in-place mode (edit user's files directly)
+    python scripts/scaffold.py --kernel k.py --test t.py --perf p.py \
+        --op-name my_op --devices 0 \
+        --task-dir /path/to/user/project
 
 Output (last line of stdout):
     {"task_dir": "/absolute/path/to/task_dir", "status": "ok"}
@@ -63,12 +85,24 @@ def scaffold_task_dir(
     code_checker_enabled: bool | None = None,
     kernel_source_path: str | None = None,
     worker_url: str = "",
+    task_dir: str | None = None,
 ) -> str:
-    """Create task directory with all files. Returns absolute path.
+    """Create (or adopt) a task directory. Returns absolute path.
 
-    New workflow: writes kernel + test + perf (no ref). The test/perf
-    filenames are derived from the user's source filenames if provided,
-    else fall back to TEST_FILE_DEFAULT / PERF_FILE_DEFAULT.
+    Modes:
+      - `task_dir` is None (copy mode, default): create a fresh
+        `<output_dir>/<op>_<ts>_<uuid>/` and copy kernel/test/perf into
+        it. The user's originals stay untouched.
+      - `task_dir` is a path (in-place mode): the path must exist; AR
+        writes `.ar_state/`, `task.yaml`, and a git baseline commit
+        directly there. kernel/test/perf are NOT copied —
+        `editable_files` / `test_file` / `perf_file` reference the
+        user's original filenames. The agent will edit the user's
+        original kernel in place.
+
+    In both modes the test/perf filenames are derived from the user's
+    source filenames if provided, else fall back to
+    TEST_FILE_DEFAULT / PERF_FILE_DEFAULT.
     """
     if max_rounds is None:
         max_rounds = default_max_rounds()
@@ -81,50 +115,72 @@ def scaffold_task_dir(
     if perf_filename is None:
         perf_filename = PERF_FILE_DEFAULT
 
-    if output_dir:
-        base_dir = output_dir
+    in_place = bool(task_dir)
+    if in_place:
+        # Adopt the user's directory verbatim. We only write .ar_state/,
+        # task.yaml, and the git baseline commit there. kernel/test/perf
+        # are NOT copied — they're already in this directory.
+        task_dir = os.path.abspath(task_dir)
+        if not os.path.isdir(task_dir):
+            raise NotADirectoryError(
+                f"--task-dir does not exist or is not a directory: {task_dir}")
+        # Sanity: the kernel/test/perf filenames the user passed must
+        # resolve inside this directory. If they don't, the user mixed
+        # up --task-dir with files that live elsewhere.
+        for fname, kind in [(editable_filename, "kernel"),
+                            (test_filename, "test"),
+                            (perf_filename, "perf")]:
+            if not os.path.isfile(os.path.join(task_dir, fname)):
+                raise FileNotFoundError(
+                    f"in-place mode: {kind} file {fname!r} not found inside "
+                    f"--task-dir {task_dir}. The --kernel/--test/--perf "
+                    f"files must live inside the --task-dir directory.")
+        discovered_data_files: list[str] = []
     else:
-        base_dir = os.path.join(os.getcwd(), "ar_tasks")
+        if output_dir:
+            base_dir = output_dir
+        else:
+            base_dir = os.path.join(os.getcwd(), "ar_tasks")
 
-    dir_name = f"{op_name}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-    task_dir = os.path.join(base_dir, dir_name)
-    os.makedirs(task_dir)
+        dir_name = f"{op_name}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        task_dir = os.path.join(base_dir, dir_name)
+        os.makedirs(task_dir)
 
-    # Write kernel + test + perf from the user's files.
-    _write(task_dir, editable_filename, kernel_code)
-    _write(task_dir, test_filename, test_code)
-    _write(task_dir, perf_filename, perf_code)
+        # Write kernel + test + perf from the user's files.
+        _write(task_dir, editable_filename, kernel_code)
+        _write(task_dir, test_filename, test_code)
+        _write(task_dir, perf_filename, perf_code)
 
-    # Sibling data files (e.g. .json shape lists, .pt caches) that the
-    # kernel/test/perf scripts may read at runtime. Scan the kernel's
-    # source directory for files matching the kernel's stem prefix.
-    discovered_data_files: list[str] = []
-    if kernel_source_path:
-        try:
-            import shutil as _shutil
-            src_dir = os.path.dirname(os.path.abspath(kernel_source_path))
-            kernel_stem = os.path.splitext(
-                os.path.basename(kernel_source_path))[0]
-            for fname in sorted(os.listdir(src_dir)):
-                if fname.startswith("."):
-                    continue
-                ext = os.path.splitext(fname)[1].lower()
-                if ext not in (".json", ".pt", ".npz"):
-                    continue
-                stem, _ = os.path.splitext(fname)
-                # Match files whose stem is the kernel stem or starts
-                # with "<kernel_stem>_". This avoids copying every
-                # neighbouring op's data file.
-                if stem != kernel_stem and not stem.startswith(kernel_stem + "_"):
-                    continue
-                src = os.path.join(src_dir, fname)
-                if not os.path.isfile(src):
-                    continue
-                _shutil.copy(src, os.path.join(task_dir, fname))
-                discovered_data_files.append(fname)
-        except Exception as _e:
-            print(f"[scaffold] WARNING: sidecar data file copy failed: {_e}",
-                  file=sys.stderr)
+        # Sibling data files (e.g. .json shape lists, .pt caches) that the
+        # kernel/test/perf scripts may read at runtime. Scan the kernel's
+        # source directory for files matching the kernel's stem prefix.
+        discovered_data_files = []
+        if kernel_source_path:
+            try:
+                import shutil as _shutil
+                src_dir = os.path.dirname(os.path.abspath(kernel_source_path))
+                kernel_stem = os.path.splitext(
+                    os.path.basename(kernel_source_path))[0]
+                for fname in sorted(os.listdir(src_dir)):
+                    if fname.startswith("."):
+                        continue
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext not in (".json", ".pt", ".npz"):
+                        continue
+                    stem, _ = os.path.splitext(fname)
+                    # Match files whose stem is the kernel stem or starts
+                    # with "<kernel_stem>_". This avoids copying every
+                    # neighbouring op's data file.
+                    if stem != kernel_stem and not stem.startswith(kernel_stem + "_"):
+                        continue
+                    src = os.path.join(src_dir, fname)
+                    if not os.path.isfile(src):
+                        continue
+                    _shutil.copy(src, os.path.join(task_dir, fname))
+                    discovered_data_files.append(fname)
+            except Exception as _e:
+                print(f"[scaffold] WARNING: sidecar data file copy failed: {_e}",
+                      file=sys.stderr)
 
     # Generate task.yaml. The new workflow puts test_file + perf_file
     # under the `eval` block (where loader expects them).
@@ -223,7 +279,15 @@ def _make_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-rounds", type=int, default=default_max_rounds())
     parser.add_argument("--eval-timeout", type=int, default=default_eval_timeout())
     parser.add_argument("--output-dir", default=None,
-                        help="Parent directory for the task (default: ./ar_tasks/)")
+                        help="Parent directory for the task (default: ./ar_tasks/). "
+                             "Ignored when --task-dir is given.")
+    parser.add_argument("--task-dir", default=None,
+                        help="Existing directory to adopt as the task directory "
+                             "(in-place mode). AR writes .ar_state/, task.yaml, "
+                             "and a git baseline commit there; kernel/test/perf "
+                             "are NOT copied — the agent edits the user's "
+                             "original files. The --kernel/--test/--perf files "
+                             "must live inside this directory.")
     parser.add_argument("--run-baseline", action="store_true",
                         help="Also run baseline eval after scaffolding")
     # Single flag, store_const so the absence of --no-code-checker yields
@@ -287,32 +351,74 @@ def main():
                           "error": "--op-name is required"}))
         sys.exit(1)
 
-    # Read kernel file
-    if not os.path.isfile(args.kernel):
-        print(json.dumps({"status": "error",
-                          "error": f"Kernel file not found: {args.kernel}"}))
-        sys.exit(1)
-    with open(args.kernel, "r", encoding="utf-8") as f:
-        kernel_code = f.read()
+    # In-place mode: --task-dir must point to an existing directory that
+    # contains the --kernel/--test/--perf files. We do NOT read the file
+    # contents (no copies are written) — we only validate existence and
+    # derive the basenames.
+    in_place = bool(args.task_dir)
+    if in_place:
+        if not os.path.isdir(args.task_dir):
+            print(json.dumps({"status": "error",
+                              "error": (f"--task-dir does not exist or is not "
+                                        f"a directory: {args.task_dir}")}))
+            sys.exit(1)
+        # Validate that the three files live inside --task-dir. The user
+        # may have passed absolute paths from elsewhere — reject loudly
+        # so they don't get a silently broken task_dir.
+        for flag, path in [("--kernel", args.kernel),
+                           ("--test", args.test),
+                           ("--perf", args.perf)]:
+            abs_user = os.path.abspath(path)
+            abs_task = os.path.abspath(args.task_dir)
+            try:
+                rel = os.path.relpath(abs_user, abs_task)
+            except ValueError:
+                rel = path  # different drive on Windows
+            if rel.startswith("..") or os.path.isabs(rel) and not rel.startswith(os.sep):
+                # File is outside --task-dir. Allow it only if a same-named
+                # file exists inside --task-dir (sloppy but user-friendly).
+                pass
+            if not os.path.isfile(abs_user):
+                print(json.dumps({"status": "error",
+                                  "error": f"{flag} file not found: {path}"}))
+                sys.exit(1)
+        kernel_code = ""  # not used in in-place mode
+        test_code = ""
+        perf_code = ""
+        print(f"[scaffold] In-place mode: adopting {args.task_dir} as task_dir "
+              f"(kernel/test/perf NOT copied; agent edits original files).",
+              file=sys.stderr)
+    else:
+        # Copy mode: read all three files so we can write them into the
+        # freshly-created task_dir.
+        if not os.path.isfile(args.kernel):
+            print(json.dumps({"status": "error",
+                              "error": f"Kernel file not found: {args.kernel}"}))
+            sys.exit(1)
+        with open(args.kernel, "r", encoding="utf-8") as f:
+            kernel_code = f.read()
 
-    # Read test file
-    if not os.path.isfile(args.test):
-        print(json.dumps({"status": "error",
-                          "error": f"Test file not found: {args.test}"}))
-        sys.exit(1)
-    with open(args.test, "r", encoding="utf-8") as f:
-        test_code = f.read()
+        if not os.path.isfile(args.test):
+            print(json.dumps({"status": "error",
+                              "error": f"Test file not found: {args.test}"}))
+            sys.exit(1)
+        with open(args.test, "r", encoding="utf-8") as f:
+            test_code = f.read()
 
-    # Read perf file
-    if not os.path.isfile(args.perf):
-        print(json.dumps({"status": "error",
-                          "error": f"Perf file not found: {args.perf}"}))
-        sys.exit(1)
-    with open(args.perf, "r", encoding="utf-8") as f:
-        perf_code = f.read()
+        if not os.path.isfile(args.perf):
+            print(json.dumps({"status": "error",
+                              "error": f"Perf file not found: {args.perf}"}))
+            sys.exit(1)
+        with open(args.perf, "r", encoding="utf-8") as f:
+            perf_code = f.read()
 
-    # Preserve the user's test/perf filenames inside task_dir so the
-    # scripts' own `from <kernel_module> import ...` statements resolve.
+        print(f"[scaffold] Copy mode: creating fresh task_dir under "
+              f"{args.output_dir or './ar_tasks/'} (kernel/test/perf will be "
+              f"copied; original files stay untouched).", file=sys.stderr)
+
+    # Preserve the user's kernel/test/perf filenames so the scripts' own
+    # `from <kernel_module> import ...` statements resolve.
+    editable_filename = os.path.basename(args.kernel)
     test_filename = os.path.basename(args.test)
     perf_filename = os.path.basename(args.perf)
 
@@ -328,11 +434,13 @@ def main():
         max_rounds=args.max_rounds,
         eval_timeout=args.eval_timeout,
         output_dir=args.output_dir,
+        editable_filename=editable_filename,
         test_filename=test_filename,
         perf_filename=perf_filename,
         code_checker_enabled=args.code_checker,
         kernel_source_path=args.kernel,
         worker_url=args.worker_url,
+        task_dir=args.task_dir,
     )
 
     print(f"[scaffold] Task directory created: {task_dir}", file=sys.stderr)

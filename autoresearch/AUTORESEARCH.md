@@ -403,7 +403,8 @@ A/B/C 均适用：
 
 | 形态 | 触发条件 | 行为 |
 |---|---|---|
-| 新建任务 | `--kernel Y.py --test T.py --perf P.py --op-name N` + (`--devices` 或 `--worker-url`) | scaffold 建 task_dir → 跑 baseline → 进 PLAN |
+| 新建任务（复制模式） | `--kernel Y.py --test T.py --perf P.py --op-name N` + (`--devices` 或 `--worker-url`) | scaffold 在 `--output-dir`（默认 `ar_tasks/`）下建子目录，复制 kernel/test/perf 进去 → 跑 baseline → 进 PLAN |
+| 新建任务（原地模式） | 同上 + `--task-dir <existing_dir>` | scaffold 直接采用用户目录，原地建 `.ar_state/` + `task.yaml` + git baseline；kernel/test/perf **不复制**，agent 改原文件 → 跑 baseline → 进 PLAN |
 | 续跑最近 | `--resume`（无目录参数）| 自动找最近活跃的 task |
 | 续跑指定 | `--resume <task_dir>` 或直接 `<task_dir>` | 续指定目录 |
 
@@ -419,7 +420,8 @@ A/B/C 均适用：
 | `--worker-url` | `host:port[,host:port]` | 二选一 | — | 走远端 worker（写入 `task.yaml: worker.urls`）|
 | `--max-rounds` | int | ❌ | 30（[config.yaml](config.yaml): `defaults.max_rounds`） | 优化轮数上限，触发后进 FINISH |
 | `--eval-timeout` | int 秒 | ❌ | 600（同上 `defaults.eval_timeout`） | 单轮 eval（test + perf）的 wall-clock 上限 |
-| `--output-dir` | 路径 | ❌ | `ar_tasks` | task_dir 父目录 |
+| `--output-dir` | 路径 | ❌ | `ar_tasks` | task_dir 父目录（复制模式时生效；原地模式被 `--task-dir` 覆盖）|
+| `--task-dir` | 路径 | ❌ | — | 原地模式：已存在的目录作为 task_dir。scaffold 只写 `.ar_state/` / `task.yaml` / git baseline，不复制 kernel/test/perf；`--kernel/--test/--perf` 文件必须在该目录内。agent 直接改用户原文件 |
 | `--no-code-checker` | flag | ❌ | (启用) | 关掉 [`engine/quick_check.py`](scripts/engine/quick_check.py) 的 Triton 退化 AST 检查（一般用于调试种子 kernel）|
 
 注：`arch`（如 `ascend910b3`）由 `--devices` 选中的卡经 `npu-smi info` 自动推断，写进 `task.yaml` 仅供 dashboard / report 显示，不需要用户传。

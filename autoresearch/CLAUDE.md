@@ -6,18 +6,43 @@ external deps beyond Python + PyYAML.
 
 ## Quick Start
 
+Two modes — copy mode (default) and in-place mode (`--task-dir`).
+
+### Copy mode (default)
+
 ```bash
 # Drop sources into workspace/<op_name>_kernel.py (editable kernel),
 # workspace/<op_name>_test.py (python test script; run via `python <test_file>`,
 # the script's __main__ block runs all cases and prints `... passed!` per case), and
 # workspace/<op_name>_perf.py (perf script that prints both
 # `triton: median=X.XXms` and `cann:   median=X.XXms`), then start a
-# task. --devices is required.
+# task. --devices is required. AR copies the three files into a fresh
+# ar_tasks/<op>_<ts>_<uuid>/ directory; the agent edits the copies.
 /autoresearch --kernel workspace/<op_name>_kernel.py \
               --test workspace/<op_name>_test.py \
               --perf workspace/<op_name>_perf.py \
               --op-name <op_name> --devices 0
+```
 
+### In-place mode (`--task-dir`)
+
+When the kernel/test/perf already live in their own project repo and
+you want AR to edit them directly (no copy):
+
+```bash
+# Point --task-dir at the user's project directory. The --kernel/--test/--perf
+# files MUST live inside that directory. AR writes .ar_state/, task.yaml, and a
+# git baseline commit there; the agent edits the user's original kernel in place.
+/autoresearch --kernel <op>_kernel.py \
+              --test  <op>_test.py \
+              --perf  <op>_perf.py \
+              --op-name <op_name> --devices 0 \
+              --task-dir /path/to/user/project
+```
+
+### Resume / monitor
+
+```bash
 # Resume later
 /autoresearch --resume
 

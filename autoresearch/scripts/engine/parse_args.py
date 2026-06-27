@@ -64,10 +64,17 @@ def _build_scaffold_command(args) -> str:
         parts += ["--devices", str(args.devices)]
     parts += ["--max-rounds", str(args.max_rounds)]
     parts += ["--eval-timeout", str(args.eval_timeout)]
-    # shlex.quote here too: --output-dir "C:\tmp\my tasks" would
-    # otherwise be re-split into "C:\tmp\my" + "tasks" when the
-    # generated command line is re-parsed by bash.
-    parts += ["--output-dir", shlex.quote(args.output_dir or "ar_tasks")]
+    # In-place mode: --task-dir takes precedence over --output-dir.
+    # When the user gives --task-dir, we forward it and skip --output-dir
+    # (scaffold ignores --output-dir in in-place mode anyway, but being
+    # explicit avoids confusion in the emitted command string).
+    if getattr(args, "task_dir", None):
+        parts += ["--task-dir", shlex.quote(args.task_dir)]
+    else:
+        # shlex.quote here too: --output-dir "C:\tmp\my tasks" would
+        # otherwise be re-split into "C:\tmp\my" + "tasks" when the
+        # generated command line is re-parsed by bash.
+        parts += ["--output-dir", shlex.quote(args.output_dir or "ar_tasks")]
     parts.append("--run-baseline")
     # scaffold's CLI uses dest='code_checker' with store_const:
     # None (no flag) -> omit, let scaffold resolve from config;
@@ -177,6 +184,7 @@ def main():
         "max_rounds": args.max_rounds,
         "eval_timeout": args.eval_timeout,
         "output_dir": args.output_dir or "ar_tasks",
+        "task_dir": getattr(args, "task_dir", None),
         "run_baseline": True,
         "code_checker": getattr(args, "code_checker", None),
         "worker_url": getattr(args, "worker_url", ""),
