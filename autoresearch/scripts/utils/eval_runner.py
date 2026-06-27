@@ -60,7 +60,17 @@ _DETECT_CACHE: list = []
 
 
 def detect_local_backend() -> tuple[bool, str]:
-    """Probe whether this machine can run Ascend NPU eval locally."""
+    """Probe whether this machine can run Ascend NPU eval locally.
+
+    New workflow caveat: this probe only checks for torch + torch_npu,
+    but the user's test/perf scripts may depend on mindspore, pure
+    Python, or other runtimes. We treat a failed probe as a SOFT
+    signal — the caller (eval_client.run_eval) still attempts
+    local_eval, and if the user's scripts themselves can't import
+    their deps, eval_kernel will classify it as INFRA_FAIL with a
+    clear error message. This avoids falsely blocking local eval on
+    dev machines that have the user's deps but not torch_npu.
+    """
     if _DETECT_CACHE:
         return _DETECT_CACHE[0]
     probe_env = os.environ.copy()
@@ -71,13 +81,20 @@ def detect_local_backend() -> tuple[bool, str]:
             capture_output=True, text=True, timeout=30, env=probe_env,
         )
     except subprocess.TimeoutExpired:
-        result = (False, "ascend probe timed out (>30s)")
+        # Soft-fail: return True so caller attempts local_eval anyway.
+        # The user's test/perf scripts may not need torch_npu at all.
+        result = (True, "ascend probe timed out (>30s) — proceeding anyway")
     except Exception as e:
-        result = (False, f"ascend probe failed to launch: {e}")
+        result = (True, f"ascend probe failed to launch: {e} — proceeding anyway")
     else:
         line = (r.stdout or r.stderr or "").strip().splitlines()
         msg = line[-1] if line else "(no output)"
-        result = (r.returncode == 0, msg)
+        # Soft-fail: even if torch_npu is missing, proceed — the user's
+        # scripts may use mindspore or pure Python.
+        if r.returncode == 0:
+            result = (True, msg)
+        else:
+            result = (True, f"{msg} — proceeding anyway (test/perf may not need torch_npu)")
     _DETECT_CACHE.append(result)
     return result
 
