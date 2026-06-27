@@ -219,7 +219,8 @@ def scaffold_task_dir(
     _write(task_dir, "task.yaml", yaml_content)
 
     os.makedirs(os.path.join(task_dir, ".ar_state"), exist_ok=True)
-    _git_init(task_dir)
+    _git_init(task_dir, in_place=in_place,
+              editable_files=[editable_filename])
 
     return os.path.abspath(task_dir)
 
@@ -233,19 +234,67 @@ def _write(task_dir: str, rel_path: str, content: str):
         f.write(content)
 
 
-def _git_init(task_dir: str):
+def _git_init(task_dir: str, in_place: bool = False,
+              editable_files: list | None = None):
     """Initialize git repo and create baseline commit.
 
     The actual commit goes through git_utils.commit_in_task — same code
     path hooks use for round commits, so reliability is consistent.
+
+    In-place mode caveat: when the user points --task-dir at an existing
+    project directory, that directory may already be a git repo. We must
+    NOT `git init` (harmless but redundant) and MUST NOT `git add .` —
+    that would commit the user's entire project into a single AR commit.
+    Instead we only add the AR-managed files: editable_files (the
+    kernel), task.yaml, and .ar_state/. The user's other project files
+    stay untracked or keep their existing tracked state.
     """
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from utils.git_utils import commit_in_task
 
-    subprocess.run(["git", "init"], cwd=task_dir, capture_output=True, check=True)
-    ok, info = commit_in_task(task_dir, ["."], "scaffold: baseline")
+    if not in_place:
+        # Copy mode: task_dir is a fresh empty directory, safe to init
+        # and `git add .` captures exactly the scaffolded files.
+        subprocess.run(["git", "init"], cwd=task_dir,
+                       capture_output=True, check=True)
+        ok, info = commit_in_task(task_dir, ["."], "scaffold: baseline")
+        if not ok:
+            raise RuntimeError(f"scaffold baseline commit failed: {info}")
+        return
+
+    # In-place mode: be a polite guest in the user's repo.
+    already_repo = os.path.isdir(os.path.join(task_dir, ".git"))
+    if not already_repo:
+        subprocess.run(["git", "init"], cwd=task_dir,
+                       capture_output=True, check=True)
+
+    # Only commit the AR-managed files. `git add` on a path that's
+    # already tracked by the user's repo is fine (we just record the
+    # current state as the AR baseline); paths the user's .gitignore
+    # excludes will be skipped by git, which is the right behaviour.
+    paths_to_commit: list[str] = []
+    for ef in editable_files or []:
+        if os.path.isfile(os.path.join(task_dir, ef)):
+            paths_to_commit.append(ef)
+    paths_to_commit.append("task.yaml")
+    # .ar_state/ — commit the (empty) directory so round commits can
+    # add files inside it without surprises.
+    ar_state = os.path.join(task_dir, ".ar_state")
+    if os.path.isdir(ar_state):
+        # Keep a .gitkeep so the empty dir is committable.
+        gitkeep = os.path.join(ar_state, ".gitkeep")
+        if not os.path.exists(gitkeep):
+            with open(gitkeep, "w", encoding="utf-8") as f:
+                f.write("")
+        paths_to_commit.append(os.path.join(".ar_state", ".gitkeep"))
+
+    ok, info = commit_in_task(task_dir, paths_to_commit, "scaffold: baseline")
     if not ok:
-        raise RuntimeError(f"scaffold baseline commit failed: {info}")
+        # Don't hard-fail in in-place mode — a noop commit (user's repo
+        # already had these files at the same content) is acceptable.
+        # Real failures (git lock, permissions) still raise.
+        if info != "noop":
+            raise RuntimeError(f"scaffold baseline commit failed: {info}")
 
 
 # ---------------------------------------------------------------------------
@@ -362,30 +411,30 @@ def main():
                               "error": (f"--task-dir does not exist or is not "
                                         f"a directory: {args.task_dir}")}))
             sys.exit(1)
-        # Validate that the three files live inside --task-dir. The user
-        # may have passed absolute paths from elsewhere — reject loudly
-        # so they don't get a silently broken task_dir.
+        # In in-place mode the three files MUST resolve inside --task-dir.
+        # We resolve by basename: whatever absolute or relative path the
+        # user passed, we look for `<task_dir>/<basename>` and require it
+        # to exist. This is permissive about the input form (user can pass
+        # either `kernel.py` or `/some/other/path/kernel.py`) but strict
+        # about the result: the file must be present in task_dir.
+        abs_task = os.path.abspath(args.task_dir)
         for flag, path in [("--kernel", args.kernel),
                            ("--test", args.test),
                            ("--perf", args.perf)]:
-            abs_user = os.path.abspath(path)
-            abs_task = os.path.abspath(args.task_dir)
-            try:
-                rel = os.path.relpath(abs_user, abs_task)
-            except ValueError:
-                rel = path  # different drive on Windows
-            if rel.startswith("..") or os.path.isabs(rel) and not rel.startswith(os.sep):
-                # File is outside --task-dir. Allow it only if a same-named
-                # file exists inside --task-dir (sloppy but user-friendly).
-                pass
-            if not os.path.isfile(abs_user):
+            basename = os.path.basename(path)
+            resolved = os.path.join(abs_task, basename)
+            if not os.path.isfile(resolved):
                 print(json.dumps({"status": "error",
-                                  "error": f"{flag} file not found: {path}"}))
+                                  "error": (f"in-place mode: {flag} file "
+                                            f"{basename!r} not found inside "
+                                            f"--task-dir {abs_task}. The "
+                                            f"--kernel/--test/--perf files "
+                                            f"must live inside --task-dir.")}))
                 sys.exit(1)
         kernel_code = ""  # not used in in-place mode
         test_code = ""
         perf_code = ""
-        print(f"[scaffold] In-place mode: adopting {args.task_dir} as task_dir "
+        print(f"[scaffold] In-place mode: adopting {abs_task} as task_dir "
               f"(kernel/test/perf NOT copied; agent edits original files).",
               file=sys.stderr)
     else:
