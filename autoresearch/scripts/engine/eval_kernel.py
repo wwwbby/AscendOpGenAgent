@@ -145,13 +145,28 @@ def _run_subprocess(cmd: list[str], cwd: str, env: dict,
                 + f"\n[eval_kernel] timed out after {timeout}s")
 
 
-def _build_env(device_id: int) -> dict:
+def _build_env(device_id: int, task_dir: str | None = None) -> dict:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["DEVICE_ID"] = str(device_id)
     env["ASCEND_RT_VISIBLE_DEVICES"] = str(device_id)
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     env["PYTHONIOENCODING"] = "utf-8"
+    # Ensure the task_dir is on sys.path so the test/perf scripts' own
+    # `from <kernel_module> import ...` statements resolve. On POSIX,
+    # `python <script>` with cwd=task_dir usually does this implicitly
+    # (cwd lands in sys.path[0]), but Windows doesn't always, and an
+    # explicit PYTHONPATH is the reliable cross-platform fix. This is
+    # especially important in in-place mode where the kernel file is
+    # imported by its original module name (e.g.
+    # `sparse_flash_attention_triton`).
+    if task_dir:
+        abs_task = os.path.abspath(task_dir)
+        existing = env.get("PYTHONPATH", "")
+        if existing:
+            env["PYTHONPATH"] = abs_task + os.pathsep + existing
+        else:
+            env["PYTHONPATH"] = abs_task
     return env
 
 
@@ -396,7 +411,7 @@ def main():
         sys.exit(2)
 
     task_dir = os.path.abspath(args.task_dir)
-    env = _build_env(args.device_id)
+    env = _build_env(args.device_id, task_dir)
 
     result: dict = {
         "verify": None,

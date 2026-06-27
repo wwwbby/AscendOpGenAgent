@@ -42,7 +42,8 @@ follow the latest `[AR Phase: ...]` message and never stop between phases.
 
 | flags | initial phase |
 |-------|---------------|
-| `--kernel Y.py --test T.py --perf P.py` | `BASELINE` runs first; OK / KERNEL_FAIL (perf base measured) → `PLAN`; INFRA_FAIL / no valid perf base → task parks at `BASELINE` with no committed progress, fix env/test/perf/worker and re-run |
+| `--kernel Y.py --test T.py --perf P.py` (copy mode) | `BASELINE` runs first; OK / KERNEL_FAIL (perf base measured) → `PLAN`; INFRA_FAIL / no valid perf base → task parks at `BASELINE` with no committed progress, fix env/test/perf/worker and re-run |
+| `--kernel Y.py --test T.py --perf P.py --task-dir <dir>` (in-place mode) | same as above, but task_dir = `<dir>`; kernel/test/perf are NOT copied, agent edits originals |
 
 ## Step 1 — Parse `$ARGUMENTS`
 
