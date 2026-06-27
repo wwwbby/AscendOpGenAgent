@@ -43,8 +43,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
+
+# Ensure `scripts/` is on sys.path so `from utils.json_io import ...`
+# resolves when this file is launched as a subprocess by eval_runner
+# with cwd=task_dir (the user's directory in in-place mode, or
+# ar_tasks/<op>/ in copy mode). Without this, Python puts only this
+# file's own directory (scripts/engine/) on sys.path[0], not scripts/,
+# and `import utils` fails.
+_SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import re
 import traceback
 
 
