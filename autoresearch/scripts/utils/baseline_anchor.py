@@ -1,18 +1,15 @@
-"""Pure helpers for sticky baseline anchor ownership.
+"""Pure helpers for baseline anchor ownership (new workflow).
 
-The eval pipeline has three callers that care about the PyTorch/ref
-anchor:
-  - eval_request decides whether sticky baseline can skip ref profiling.
-  - workflow.baseline records the round-0 anchor.
-  - workflow.round refreshes the anchor when a later round finally has a
-    comparable fresh ref measurement.
+The new workflow runs a single subprocess per round that invokes the
+user's test script + perf script. The perf script measures BOTH gen
+(triton kernel) and base (CANN reference) timings, so there is no
+separate "ref pass" and no sticky baseline — every round re-measures
+base. These helpers simply record/refresh the anchor from each round's
+fresh base_latency_us.
 
-Keeping the rules here prevents those paths from drifting.
-
-AOA fingerprint only tracks `num_cases` — task.yaml schema doesn't
-surface warmup_times / run_times, so they can't vary between rounds for
-the same task. Fingerprints with extra keys on `stored` are tolerated:
-comparisons only consult the keys in `current`.
+Field-name compatibility: eval_assemble still writes `ref_latency_us`
+as an alias for `base_latency_us` so the legacy field reads below keep
+working; `baseline_source` is now `"base"` (was `"ref"`).
 """
 from __future__ import annotations
 
@@ -32,18 +29,16 @@ def valid_per_shape(values: Any) -> Optional[list[float]]:
 
 
 def current_fingerprint(num_cases: Any) -> dict[str, int]:
-    """Fingerprint the eval settings that make ref timings comparable."""
+    """Fingerprint kept for shape parity; sticky reuse is gone but the
+    field is still written so old progress files don't break."""
     return {"num_cases": int(num_cases or 1)}
 
 
 def fingerprint_mismatch(stored: Any,
                          current: dict[str, int]) -> Optional[dict[str, Any]]:
-    """Return changed keys, or None when sticky reuse is allowed.
-
-    Missing/empty fingerprints are tolerated for sticky override (a fresh
-    task carries no fingerprint until the first ref is measured). Callers
-    that have a fresh ref can still re-anchor and write a new fingerprint.
-    """
+    """Return changed keys, or None. Kept for callers that still pass a
+    fingerprint; in the new workflow this never triggers a re-anchor
+    because base is re-measured every round."""
     if not isinstance(stored, dict) or not stored:
         return None
     mismatch = {
@@ -56,8 +51,6 @@ def fingerprint_mismatch(stored: Any,
 
 def exact_fingerprint_match(stored: Any,
                             current: dict[str, int]) -> bool:
-    """Strict equality on the num_cases key (tolerating extras on
-    `stored`)."""
     if not isinstance(stored, dict):
         return False
     return stored.get("num_cases") == current["num_cases"]
@@ -78,22 +71,13 @@ class StickyDecision:
 def sticky_override_from_progress(progress: Any,
                                   fingerprint: dict[str, int]
                                   ) -> StickyDecision:
-    """Return the sticky baseline override when the stored anchor is valid."""
-    if progress is None or progress.get("baseline_source") != "ref":
-        return StickyDecision(None)
-    metric = progress.get("baseline_metric")
-    if not valid_metric(metric):
-        return StickyDecision(None)
+    """New workflow has no sticky baseline — always returns None.
 
-    mismatch = fingerprint_mismatch(
-        progress.get("baseline_fingerprint"), fingerprint)
-    if mismatch:
-        return StickyDecision(None, mismatch=mismatch)
-
-    return StickyDecision(StickyOverride(
-        metric=float(metric),
-        per_shape_us=valid_per_shape(progress.get("baseline_per_shape_us")),
-    ))
+    Kept for call-site compatibility (eval_request still imports this
+    symbol); callers that consult `decision.override` will simply always
+    fall through to a fresh eval, which is what we want now.
+    """
+    return StickyDecision(None)
 
 
 @dataclass(frozen=True)
@@ -125,8 +109,12 @@ def _changed(progress: Any, decision: AnchorDecision) -> bool:
     )
 
 
-def _ref_from_metrics(metrics: dict[str, Any]) -> Optional[float]:
-    value = metrics.get("ref_latency_us")
+def _base_from_metrics(metrics: dict[str, Any]) -> Optional[float]:
+    """Read the perf-script-measured base latency. Falls back to the
+    legacy `ref_latency_us` alias written by eval_assemble."""
+    value = metrics.get("base_latency_us")
+    if not valid_metric(value):
+        value = metrics.get("ref_latency_us")
     return float(value) if valid_metric(value) else None
 
 
@@ -136,68 +124,29 @@ def _per_shape_from_metrics(metrics: dict[str, Any]) -> Optional[list[float]]:
 
 def resolve_baseline_init_anchor(progress: Any, metrics: dict[str, Any],
                                  ) -> AnchorDecision:
-    """Choose the anchor written by round-0 baseline initialization."""
-    ref_metric = _ref_from_metrics(metrics)
+    """Choose the anchor written by round-0 baseline initialization.
+
+    New workflow: every round's perf script produces a fresh base
+    latency, so we just adopt it when present. No sticky reuse path.
+    """
+    base_metric = _base_from_metrics(metrics)
     fp = current_fingerprint(metrics.get("num_cases") or 1)
 
-    existing_metric = progress.get("baseline_metric")
-    existing_source = progress.get("baseline_source")
-    existing_fp = progress.get("baseline_fingerprint")
-
-    if valid_metric(existing_metric) and existing_source == "ref":
-        if exact_fingerprint_match(existing_fp, fp):
-            return AnchorDecision(
-                metric=float(existing_metric),
-                source="ref",
-                per_shape_us=valid_per_shape(
-                    progress.get("baseline_per_shape_us")),
-                fingerprint=existing_fp,
-                reused_existing=True,
-                changed=False,
-                message=(f"sticky baseline = {existing_metric} "
-                         f"(fingerprint match; this round's ref="
-                         f"{ref_metric} ignored)"),
-            )
-        if ref_metric is not None:
-            return AnchorDecision(
-                metric=ref_metric,
-                source="ref",
-                per_shape_us=_per_shape_from_metrics(metrics),
-                fingerprint=fp,
-                reused_existing=False,
-                changed=True,
-                message=(f"fingerprint changed ({existing_fp} -> {fp}); "
-                         f"re-anchoring to fresh ref={ref_metric}"),
-            )
+    if base_metric is not None:
         return AnchorDecision(
-            metric=float(existing_metric),
-            source="ref",
-            per_shape_us=valid_per_shape(
-                progress.get("baseline_per_shape_us")),
-            fingerprint=existing_fp,
-            reused_existing=True,
-            changed=False,
-            message=(f"WARN: fingerprint changed ({existing_fp} -> {fp}) "
-                     f"but no fresh ref this round; keeping stale "
-                     f"baseline={existing_metric} with stale fingerprint "
-                     f"to avoid misrepresenting the anchor"),
-        )
-
-    if ref_metric is not None:
-        return AnchorDecision(
-            metric=ref_metric,
-            source="ref",
+            metric=base_metric,
+            source="base",
             per_shape_us=_per_shape_from_metrics(metrics),
             fingerprint=fp,
             reused_existing=False,
             changed=True,
-            message=f"baseline = ref_latency_us = {ref_metric} (PyTorch reference)",
+            message=(f"baseline = base_latency_us = {base_metric} "
+                     f"(perf script CANN measurement)"),
         )
 
-    # No valid PyTorch reference latency → no baseline. Seed timing is
-    # NOT a substitute (optimising against the seed's own time is
-    # meaningless), so return an empty anchor; run_baseline_init's gate
-    # refuses to commit and parks the task at BASELINE for retry.
+    # No valid perf base latency → no baseline. Seed timing is NOT a
+    # substitute; run_baseline_init's gate refuses to commit and parks
+    # the task at BASELINE for retry.
     return AnchorDecision(
         metric=None,
         source="none",
@@ -205,7 +154,7 @@ def resolve_baseline_init_anchor(progress: Any, metrics: dict[str, Any],
         fingerprint=None,
         reused_existing=False,
         changed=True,
-        message="no valid ref_latency_us; baseline unmeasured (not committed)",
+        message="no valid base_latency_us; baseline unmeasured (not committed)",
     )
 
 
@@ -213,15 +162,12 @@ def refresh_round_anchor(progress: Any,
                          metrics: dict[str, Any]) -> AnchorDecision:
     """Refresh Progress.baseline_* after a normal optimization round.
 
-    Sticky reuse is preferred while the stored fingerprint matches the
-    current config. When a mismatch forced eval_request to re-run ref
-    profiling and the round returns a fresh ref_latency_us, we re-anchor
-    here so future rounds become sticky again. When baseline_metric is
-    still None (SEED couldn't produce ref), the first round with a valid
-    ref_latency_us captures the anchor — that backfill is what unblocks
-    speedup display for tasks whose seed kernel failed verify.
+    New workflow: each round's perf script re-measures base, so we
+    simply adopt the fresh value when present and keep the existing
+    anchor otherwise (e.g. when the kernel crashed mid-perf and base
+    wasn't measured this round).
     """
-    ref_metric = _ref_from_metrics(metrics)
+    base_metric = _base_from_metrics(metrics)
     fp = current_fingerprint(metrics.get("num_cases") or 1)
 
     existing_metric = progress.get("baseline_metric")
@@ -230,39 +176,16 @@ def refresh_round_anchor(progress: Any,
         progress.get("baseline_per_shape_us"))
     existing_fp = progress.get("baseline_fingerprint")
 
-    if valid_metric(existing_metric) and existing_source == "ref":
-        mismatch = fingerprint_mismatch(existing_fp, fp)
-        if mismatch and ref_metric is not None:
-            return AnchorDecision(
-                metric=ref_metric,
-                source="ref",
-                per_shape_us=_per_shape_from_metrics(metrics),
-                fingerprint=fp,
-                reused_existing=False,
-                changed=True,
-                message=(f"fingerprint mismatch {mismatch}; refreshed "
-                         f"baseline_metric={ref_metric:.2f}us from fresh ref"),
-            )
-        return AnchorDecision(
-            metric=float(existing_metric),
-            source="ref",
-            per_shape_us=existing_per_shape,
-            fingerprint=existing_fp,
-            reused_existing=True,
-            changed=False,
-            message=None,
-        )
-
-    if ref_metric is not None:
+    if base_metric is not None:
         decision = AnchorDecision(
-            metric=ref_metric,
-            source="ref",
+            metric=base_metric,
+            source="base",
             per_shape_us=_per_shape_from_metrics(metrics),
             fingerprint=fp,
             reused_existing=False,
             changed=True,
-            message=(f"captured baseline_metric={ref_metric:.2f}us "
-                     f"(source=ref)"),
+            message=(f"captured baseline_metric={base_metric:.2f}us "
+                     f"(source=base, perf re-measured this round)"),
         )
         return AnchorDecision(
             metric=decision.metric,

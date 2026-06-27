@@ -14,7 +14,7 @@ Layout:
                         `eval_kernel.py` via `eval_runner.local_eval`;
                         remote ships a `package_builder` tar.gz to a
                         worker `/api/v1/run` endpoint.
-    package_builder   — task.yaml + ref + editable → tar.gz bytes,
+    package_builder   — task.yaml + kernel + test + perf → tar.gz bytes,
                         for the remote transport. No deps outside loader.
 
 This `__init__.py` re-exports only the names actually imported from
@@ -25,7 +25,7 @@ reach into the submodule explicitly when you need them.
 # fmt: off
 from .loader import (
     TaskConfig, load_task_config,
-    REF_FILE_DEFAULT, py_stem,
+    TEST_FILE_DEFAULT, PERF_FILE_DEFAULT, py_stem,
 )
 from .metric_policy import (
     EvalOutcome, EvalResult, check_constraints, is_improvement, format_result_summary,

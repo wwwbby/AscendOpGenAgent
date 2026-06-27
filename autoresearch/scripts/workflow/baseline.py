@@ -209,19 +209,20 @@ def run_baseline_init(task_dir: str, eval_data: dict) -> int:
         print("[baseline] ERROR: task.yaml not found", file=sys.stderr)
         return 1
 
-    # Single hard gate: a baseline EXISTS iff the PyTorch reference was
-    # measured. Without a valid ref latency there is nothing to optimise
-    # against (speedup / KEEP-DISCARD are meaningless), so commit nothing
-    # — no Progress, no SEED row, progress_initialized stays False — and
-    # park the task at BASELINE so a retry after the env/ref/worker is
-    # fixed re-evaluates cleanly. Seed timing is NOT a substitute.
+    # Single hard gate: a baseline EXISTS iff the perf script's CANN
+    # base timing was measured. Without a valid base latency there is
+    # nothing to optimise against (speedup / KEEP-DISCARD are
+    # meaningless), so commit nothing — no Progress, no SEED row,
+    # progress_initialized stays False — and park the task at BASELINE
+    # so a retry after the env/test/perf/worker is fixed re-evaluates
+    # cleanly. Seed timing is NOT a substitute.
     metrics = eval_data.get("metrics") or {}
-    if not valid_metric(metrics.get("ref_latency_us")):
+    if not valid_metric(metrics.get("base_latency_us")):
         write_phase(task_dir, BASELINE)
         clear_intent(task_dir)
-        print(f"[baseline] no valid ref baseline "
-              f"({eval_data.get('error') or 'ref_latency_us missing'}) — "
-              f"baseline pending; fix env/ref/worker and re-run.",
+        print(f"[baseline] no valid perf base timing "
+              f"({eval_data.get('error') or 'base_latency_us missing'}) — "
+              f"baseline pending; fix env/test/perf/worker and re-run.",
               file=sys.stderr)
         return _EXIT_FOR[EvalOutcome.INFRA_FAIL]
 

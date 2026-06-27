@@ -32,14 +32,13 @@ from .metric_policy import EvalOutcome, EvalResult
 # ---------------------------------------------------------------------------
 
 def _log_request(prefix: str, request) -> None:
-    if request.num_cases > 1:
-        print(f"[{prefix}] eval_timeout scaled per shape: "
-              f"{request.config.eval_timeout}s/shape x "
-              f"{request.num_cases} cases = {request.timeout}s",
-              file=sys.stderr)
+    # New workflow: timeout is no longer scaled by num_cases (test/perf
+    # scripts manage their own case matrices). Just log the effective
+    # timeout. sticky_note() always returns "" in the new workflow.
+    print(f"[{prefix}] eval_timeout={request.timeout}s", file=sys.stderr)
     note = request.sticky_note()
     if note:
-        print(f"[{prefix}] Skipping ref profile; {note}", file=sys.stderr)
+        print(f"[{prefix}] {note}", file=sys.stderr)
 
 
 def _normalize_worker_url(url: str) -> str:
@@ -173,11 +172,9 @@ def run_eval(task_dir: str, config: TaskConfig,
             "op_name": request.config.name,
             "timeout": str(int(request.timeout)),
         }
-        if request.override_base_us is not None and request.override_base_us > 0:
-            fields["override_base_us"] = f"{request.override_base_us:.6f}"
-        if request.override_base_per_shape_us:
-            fields["override_base_per_shape_us"] = json.dumps(
-                [float(v) for v in request.override_base_per_shape_us])
+        # New workflow: no override_base_us / override_base_per_shape_us
+        # form fields — the perf script measures base every round, so
+        # there is no sticky baseline to override.
 
         try:
             resp = _multipart_post(
@@ -185,12 +182,10 @@ def run_eval(task_dir: str, config: TaskConfig,
                 fields=fields,
                 files={"package": ("package.tar.gz", package,
                                    "application/gzip")},
-                # Worker runs ref(profile_base) + kernel(verify,profile_gen)
-                # sequentially, each bounded by request.timeout; only the
-                # kernel pass runs when sticky lets it skip base profiling.
-                # Wait for the worst-case wall time, else the client
-                # disconnects mid-eval and the worker aborts with HTTP 499.
-                timeout=request.timeout * (1 if request.sticky else 2) + 60,
+                # New workflow: single subprocess runs test + perf, bounded
+                # by request.timeout. Add a 60s buffer for worker overhead
+                # (tar extract, import, result assembly).
+                timeout=request.timeout + 60,
             )
         except Exception as e:
             # Pull the response body out of HTTPError so structured worker
@@ -248,20 +243,18 @@ def run_eval(task_dir: str, config: TaskConfig,
 
     kernel_basename = (py_stem(config.editable_files[0])
                        if config.editable_files else "kernel")
-    ref_basename = py_stem(config.ref_file)
+    # New workflow: pass test_file + perf_file (with .py extension, as
+    # eval_kernel.py expects filenames not stems). No sticky baseline.
     print(f"[local_eval] device={dev}; eval_kernel.py "
-          f"(verify + profile_gen"
-          f"{'' if request.sticky else ' + profile_base'})...",
-          file=sys.stderr)
+          f"(test + perf)...", file=sys.stderr)
 
     verify_resp, profile_resp = local_eval(
         task_dir=task_dir,
         op_name=config.name,
         kernel_file=kernel_basename,
-        ref_file=ref_basename,
+        test_file=config.test_file,
+        perf_file=config.perf_file,
         timeout=request.timeout,
         device_id=dev,
-        override_base_time_us=request.override_base_us,
-        override_base_per_shape_us=request.override_base_per_shape_us,
     )
     return _assemble_eval_result(verify_resp, profile_resp)

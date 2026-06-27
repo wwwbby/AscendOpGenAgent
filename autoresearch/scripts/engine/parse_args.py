@@ -16,7 +16,7 @@ between the user and the LLM closes that drift.
 
 Modes:
   resume     — `--resume [task_dir]` or a bare existing task path
-  scaffold   — init flags (--ref + --kernel + --op-name + --devices)
+  scaffold   — init flags (--kernel + --test + --perf + --op-name + --devices)
   ask        — empty args, or scaffold flags incomplete
 
 Output (single JSON line on stdout):
@@ -55,8 +55,9 @@ def _build_scaffold_command(args) -> str:
     or whitespace quirks in the user's typed string.
     """
     parts = ["python", "scripts/scaffold.py"]
-    parts += ["--ref", shlex.quote(args.ref)]
     parts += ["--kernel", shlex.quote(args.kernel)]
+    parts += ["--test", shlex.quote(args.test)]
+    parts += ["--perf", shlex.quote(args.perf)]
     if args.op_name:
         parts += ["--op-name", shlex.quote(args.op_name)]
     if args.devices:
@@ -88,8 +89,9 @@ def main():
             "command": None,
             "values": {},
             "missing": [
-                "--ref <file>",
                 "--kernel <file>",
+                "--test <file>",
+                "--perf <file>",
                 "--op-name <name>",
                 "--devices <N>",
                 f"--max-rounds (optional, default {default_max_rounds()})",
@@ -157,23 +159,19 @@ def main():
             "missing": [f"argparse rejected the args: {e.msg}"],
         })
 
-    # Workflow-level required fields. argparse already enforces --ref and
-    # --kernel as required positionals; the rest we check here so the LLM
+    # Workflow-level required fields. argparse already enforces --kernel,
+    # --test, --perf as required; the rest we check here so the LLM
     # gets a single error list.
     missing = []
     if not args.op_name:
         missing.append("--op-name <name>")
-    # scaffold accepts --worker-url as the remote-only escape from local
-    # --devices. Keep parse_args in lockstep so a dev box without an NPU
-    # can fire `/autoresearch --ref ... --kernel ... --op-name ...
-    # --worker-url ...` without being kicked into ask mode for a missing
-    # --devices it shouldn't need.
     if not args.devices and not getattr(args, "worker_url", ""):
         missing.append("--devices <N> (or --worker-url <host:port>)")
 
     values = {
-        "ref": args.ref,
         "kernel": args.kernel,
+        "test": args.test,
+        "perf": args.perf,
         "op_name": args.op_name,
         "devices": args.devices,
         "max_rounds": args.max_rounds,

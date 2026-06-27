@@ -7,9 +7,14 @@ external deps beyond Python + PyYAML.
 ## Quick Start
 
 ```bash
-# Drop sources into workspace/<op_name>_ref.py and workspace/<op_name>_kernel.py,
-# then start a task. --devices is required.
-/autoresearch --ref workspace/<op_name>_ref.py --kernel workspace/<op_name>_kernel.py \
+# Drop sources into workspace/<op_name>_kernel.py (editable kernel),
+# workspace/<op_name>_test.py (pytest-style correctness test), and
+# workspace/<op_name>_perf.py (perf script that prints both
+# `triton: median=X.XXms` and `cann:   median=X.XXms`), then start a
+# task. --devices is required.
+/autoresearch --kernel workspace/<op_name>_kernel.py \
+              --test workspace/<op_name>_test.py \
+              --perf workspace/<op_name>_perf.py \
               --op-name <op_name> --devices 0
 
 # Resume later
@@ -33,7 +38,8 @@ python scripts/ar_cli.py worker --remote-host my-npu --start \
     --backend ascend --devices 0 --port 9111
 
 # Point /autoresearch (or baseline.py / pipeline.py) at the tunneled port.
-/autoresearch --ref ... --kernel ... --devices 0 --worker-url 127.0.0.1:9111
+/autoresearch --kernel ... --test ... --perf ... \
+              --devices 0 --worker-url 127.0.0.1:9111
 ```
 
 `ar_cli worker --remote-host my-npu --stop --port 9111` tears down both

@@ -109,22 +109,19 @@ def assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
         if per_gen is not None else []
     )
 
-    # Outcome — non-OK paths:
-    #   error_source == "ref"    → broken --ref source file. INFRA_FAIL.
-    #   error_source == "infra"  → worker-side infra failure (tar extract,
-    #                              missing task.yaml, internal eval crash;
-    #                              set by worker._error_response). INFRA_FAIL.
-    #   anything else failing    → kernel responsibility. KERNEL_FAIL.
-    # Pure-infra failures (no backend / no NPU) set INFRA_FAIL before
-    # we ever reach this assembler.
-    if error_source in ("ref", "infra"):
+    # Outcome — new workflow (subprocess eval):
+    #   error_source == "infra"  → test/perf script itself broken (pytest
+    #                              collection error, missing file, internal
+    #                              eval crash, worker-side infra). INFRA_FAIL.
+    #   verify_ok and gen_ok     → kernel passed test + produced timing. OK.
+    #   verify_ok == False       → kernel correctness failure (test failed
+    #                              or perf crashed). KERNEL_FAIL.
+    #   perf crashed (gen_ok False) but test passed → KERNEL_FAIL too
+    #                              (kernel works on tiny inputs but crashes
+    #                              on perf-sized inputs).
+    if error_source == "infra":
         outcome = EvalOutcome.INFRA_FAIL
     elif verify_ok and gen_ok and not crashed_shapes:
-        # gen_ok gates out the metric-less "OK": when the whole profile_gen
-        # block is missing (per_gen is None) crashed_shapes is empty, so
-        # without this check a kernel with no timing at all would report OK
-        # and force downstream readers into the "OK but no metric" path.
-        # Requiring a finite gen timing lands that case as KERNEL_FAIL.
         outcome = EvalOutcome.OK
     else:
         outcome = EvalOutcome.KERNEL_FAIL
@@ -132,20 +129,25 @@ def assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
     metrics: dict = {}
 
     # --- timing + speedup ---------------------------------------------
-    # ref_latency_us and latency_us are recorded INDEPENDENTLY: a SEED
-    # round where the kernel crashed (gen_ok=False) but the PyTorch ref
-    # measured cleanly still has a valid base_time we want to anchor
-    # baseline_metric on.
+    # base_latency_us (from perf script's CANN measurement) and latency_us
+    # (from perf script's triton measurement) are recorded INDEPENDENTLY:
+    # a SEED round where the kernel crashed (gen_ok=False) but the perf
+    # script still measured base cleanly has a valid base_time we want
+    # to anchor baseline_metric on.
+    # Also write `ref_latency_us` as an alias so downstream code
+    # (baseline_anchor, progress_reducer) that still reads the old field
+    # name keeps working without a sweeping rename.
     if gen_ok:
         metrics["latency_us"] = gen_time
     else:
         print(f"[eval] WARNING: no valid gen_time (got {gen_time!r}) - "
-              f"kernel profile likely failed", file=sys.stderr)
+              f"kernel perf likely failed", file=sys.stderr)
     if base_ok:
-        metrics["ref_latency_us"] = base_time
+        metrics["base_latency_us"] = base_time
+        metrics["ref_latency_us"] = base_time  # alias for back-compat
     else:
         print(f"[eval] WARNING: no valid base_time (got {base_time!r}) - "
-              f"ref baseline unavailable this round", file=sys.stderr)
+              f"perf base unavailable this round", file=sys.stderr)
     if gen_ok and base_ok:
         metrics["speedup_vs_ref"] = base_time / gen_time
     elif profile_resp.get("speedup"):
@@ -235,61 +237,21 @@ def assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
     if outcome == EvalOutcome.OK:
         error = None
     elif error_source == "infra":
-        # Worker-side infra failure (tar extract, missing task.yaml,
-        # internal eval crash). The detail lives in verify_log (set by
-        # worker._error_response), NOT verify_block — don't blame
-        # reference.py and don't drop the message to "(no detail)".
-        error = (f"worker infra failure: "
-                 f"{verify_log.strip() or '(no detail)'}")
-    elif outcome == EvalOutcome.INFRA_FAIL:
-        # Top-level verify_json.error was the only signal here before, but
-        # eval_kernel writes ref-side failure as a per_case entry (with
-        # failure_kind="ref_crash" / error="ref-side: …") instead of
-        # promoting to top-level. Surface the first ref-side case so
-        # "reference.py failed: (no detail)" stops swallowing the real
-        # exception.
-        top = verify_json.get("error")
-        if not top:
-            for entry in (verify_json.get("per_case") or []):
-                if isinstance(entry, dict) and (
-                        entry.get("failure_kind") == "ref_crash"
-                        or (entry.get("error") or "").startswith("ref-side:")):
-                    top = entry.get("error")
-                    break
-        error = f"reference.py failed: {top or '(no detail)'}"
+        # Test/perf script itself broken (pytest collection error, missing
+        # file, internal eval crash, worker-side infra). The detail lives
+        # in verify_json.error (set by eval_kernel.run_test_phase) or in
+        # verify_log (set by worker._error_response).
+        top = verify_json.get("error") if verify_json else None
+        error = (f"infra failure: {top or verify_log.strip() or '(no detail)'}")
     elif not verify_ok:
-        # eval_kernel tags each failed case with failure_kind
-        # (kernel_crash / kernel_miss / compare_crash / ref_crash).
-        # Prefer the enum; fall back to error-prefix string match when
-        # failure_kind is absent.
-        crash_err = None
-        clean_miss = False
-        for entry in (verify_json.get("per_case") or []):
-            if not isinstance(entry, dict):
-                continue
-            kind = entry.get("failure_kind")
-            e = entry.get("error") or ""
-            is_crash = kind in ("kernel_crash", "compare_crash") or (
-                kind is None and e.startswith(("kernel-side:", "compare:")))
-            is_miss = kind == "kernel_miss" or (
-                kind is None and e == "kernel output != reference")
-            if is_crash and crash_err is None:
-                crash_err = e
-            elif is_miss:
-                clean_miss = True
-        if crash_err:
-            error = f"kernel crashed during verify: {crash_err[:200]}"
-        elif clean_miss:
-            error = "kernel output != reference"
+        # Kernel correctness failure: test script failed or perf script
+        # crashed. eval_kernel tags the error in verify_block.
+        top = verify_json.get("error") if verify_json else None
+        if top:
+            error = f"kernel verify failed: {top[:300]}"
         else:
-            # verify subprocess died before populating per_case. Use the
-            # kernel-side returncode to distinguish: SIGKILL (rc<0,
-            # typically OOM-killer), timeout (rc==124, set by
-            # _run_subprocess_async on asyncio.TimeoutError), or other
-            # non-zero rc (import / top-level MLIR blowup before the
-            # per-case loop began). failure_extractor on raw_output_tail
-            # carries the structured signals; this string is for the
-            # dashboard and human-readable summary.
+            # verify subprocess died before populating verify_block. Use
+            # the returncode to distinguish timeout / signal / other.
             rc = verify_resp.get("returncode")
             if rc is None:
                 detail = "rc unknown"
@@ -298,17 +260,17 @@ def assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
             elif isinstance(rc, int) and rc < 0:
                 detail = f"subprocess killed by signal {-rc} (rc={rc})"
             elif rc != 0:
-                detail = f"subprocess exited rc={rc} before per-case loop"
+                detail = f"subprocess exited rc={rc}"
             else:
-                detail = "rc=0 but no per_case data (sidecar missing?)"
-            error = (f"kernel verify failed before per-case loop: {detail} "
+                detail = "rc=0 but no verify_block (sidecar missing?)"
+            error = (f"kernel verify failed: {detail} "
                      "(see failure_signals / raw_output_tail)")
     else:
         if per_gen is None:
-            error = ("kernel profile missing or invalid "
-                     "(profile_gen produced no timing data)")
+            error = ("kernel perf missing or invalid "
+                     "(perf script produced no triton timing line)")
         else:
-            error = (f"kernel crashed during profile on "
+            error = (f"kernel crashed during perf on "
                      f"{len(crashed_shapes)} of {len(per_gen)} shapes")
 
     profile_log = profile_resp.get("log", "")

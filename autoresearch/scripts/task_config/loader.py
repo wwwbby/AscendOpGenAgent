@@ -27,14 +27,18 @@ import yaml
 # `reference.py.py` or "no such file". Funnel through these constants
 # + helpers so the contract has a single owner.
 
-REF_FILE_DEFAULT = "reference.py"
+# New workflow (subprocess eval): no ref_file. The user supplies a
+# kernel (editable), a pytest-style test script, and a perf script that
+# prints `triton:  median=X.XXms` and `cann:    median=X.XXms` lines.
+TEST_FILE_DEFAULT = "test_kernel.py"
+PERF_FILE_DEFAULT = "perf_kernel.py"
 
 
 def py_stem(name: str) -> str:
     """Strip a trailing `.py` extension. Idempotent: passing in a stem
     returns it unchanged. Used at the eval_kernel / worker / eval_client
-    boundary because eval_kernel's CLI takes `--ref-file <stem>` (no
-    extension) while TaskConfig.ref_file carries the basename WITH `.py`.
+    boundary because eval_kernel's CLI takes `--test-file <stem>` (no
+    extension) while TaskConfig.test_file carries the basename WITH `.py`.
     """
     return name[:-3] if name.endswith(".py") else name
 
@@ -108,9 +112,13 @@ class TaskConfig:
 
     # Files
     editable_files: list = field(default_factory=list)
-    ref_file: str = REF_FILE_DEFAULT
+    # New workflow: user-supplied test (pytest) + perf scripts replace the
+    # old ref_file. test_file runs correctness checks; perf_file prints
+    # `triton:  median=X.XXms` + `cann:    median=X.XXms` for gen/base timing.
+    test_file: str = TEST_FILE_DEFAULT
+    perf_file: str = PERF_FILE_DEFAULT
 
-    # Sibling files the ref module reads at runtime (NPUKernelBench-style
+    # Sibling files the kernel/test/perf modules read at runtime (data
     # `<op>.json` shape lists, sglang-style `ref.pt` output caches,
     # auxiliary `.py` imports, etc.). Listed by basename relative to
     # task_dir. The remote-eval package builder ships them alongside
@@ -118,17 +126,16 @@ class TaskConfig:
     data_files: list = field(default_factory=list)
 
     # Eval params
-    # Per-SHAPE budget for verify/profile in seconds. eval_client scales it
-    # by num_cases (probed from the ref module) before invoking the eval
-    # subprocess, so the wall-clock cap is eval_timeout * num_cases.
-    # Single-shape refs (num_cases=1) keep the original semantics.
+    # Wall-clock budget for the eval subprocess (runs test + perf scripts).
+    # In the new workflow, a single subprocess runs both pytest and the
+    # perf script; num_cases is no longer probed (the test script manages
+    # its own case matrix internally).
     eval_timeout: int = 600
 
-    # Explicit case-count override (task.yaml `eval.num_cases`). When > 0,
-    # eval_request uses it directly instead of importing the ref module to
-    # probe get_inputs/get_input_groups — lets dev hosts without torch/CANN
-    # scale the eval timeout and sticky fingerprint correctly. 0 = auto.
-    num_cases: int = 0
+    # Number of test cases (task.yaml `eval.num_cases`). In the new
+    # workflow this is informational only — the test/perf scripts manage
+    # their own case matrices. Kept for timeout scaling back-compat.
+    num_cases: int = 1
 
     # Metric
     primary_metric: str = "score"
@@ -247,23 +254,35 @@ def load_task_config(task_dir: str) -> Optional[TaskConfig]:
     raw_editable = raw.get("editable_files") or []
     editable_files = _filter_contained(list(raw_editable), "editable_files")
     data_files = _filter_contained(data_files, "data_files")
-    raw_ref = agent_block.get("ref_file") or REF_FILE_DEFAULT
-    if not _is_contained(str(raw_ref)):
+
+    # New workflow: test_file + perf_file replace ref_file. Both come
+    # from the `eval` block in task.yaml (scaffold writes them there).
+    # Fall back to defaults if absent so hand-edited configs keep working.
+    raw_test = eval_block.get("test_file") or TEST_FILE_DEFAULT
+    if not _is_contained(str(raw_test)):
         import sys as _sys
-        print(f"[loader] WARNING: ref_file {raw_ref!r} escapes task_dir; "
-              f"falling back to {REF_FILE_DEFAULT}. Hand-edit task.yaml "
+        print(f"[loader] WARNING: test_file {raw_test!r} escapes task_dir; "
+              f"falling back to {TEST_FILE_DEFAULT}. Hand-edit task.yaml "
               f"if this isn't what you intended.", file=_sys.stderr)
-        raw_ref = REF_FILE_DEFAULT
+        raw_test = TEST_FILE_DEFAULT
+    raw_perf = eval_block.get("perf_file") or PERF_FILE_DEFAULT
+    if not _is_contained(str(raw_perf)):
+        import sys as _sys
+        print(f"[loader] WARNING: perf_file {raw_perf!r} escapes task_dir; "
+              f"falling back to {PERF_FILE_DEFAULT}. Hand-edit task.yaml "
+              f"if this isn't what you intended.", file=_sys.stderr)
+        raw_perf = PERF_FILE_DEFAULT
 
     config = TaskConfig(
         name=name,
         description=raw.get("description", ""),
         arch=raw.get("arch"),
         editable_files=editable_files,
-        ref_file=raw_ref,
+        test_file=raw_test,
+        perf_file=raw_perf,
         data_files=data_files,
         eval_timeout=eval_block.get("timeout", default_eval_timeout()),
-        num_cases=int(eval_block.get("num_cases", 0) or 0),
+        num_cases=int(eval_block.get("num_cases", 1) or 1),
         primary_metric=metric_block.get("primary", _metric["primary"]),
         lower_is_better=metric_block.get(
             "lower_is_better", _metric["lower_is_better"]),

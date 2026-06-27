@@ -11,17 +11,17 @@ follow the latest `[AR Phase: ...]` message and never stop between phases.
 - **`--resume`** or **`--resume <task_dir>`** — continue the most recent task
   (or the specified one).
 - **Task dir** — resume that specific task: `ar_tasks/my_task_123456_abc`.
-- **Init flags** — new task from a ref + seed kernel:
+- **Init flags** — new task from an editable kernel + test + perf:
   ```
-  --ref <file> --kernel <file> --op-name <name>
+  --kernel <file> --test <file> --perf <file> --op-name <name>
   --devices <N[,M,...]>
   [--max-rounds <N>] [--eval-timeout <sec>]
   [--no-code-checker]
   [--worker-url host:port[,host:port,...]]
   ```
-  Both `--ref` and `--kernel` are required. `--devices` selects the local
-  Ascend NPU id(s) for eval; arch is auto-derived from the picked card
-  via `npu-smi`.
+  `--kernel`, `--test`, and `--perf` are all required. `--devices`
+  selects the local Ascend NPU id(s) for eval; arch is auto-derived
+  from the picked card via `npu-smi`.
 
   `--worker-url` routes eval to a remote HTTP worker. The worker must
   already be running and reachable at that URL when eval starts. If it
@@ -29,8 +29,10 @@ follow the latest `[AR Phase: ...]` message and never stop between phases.
   or repair the worker from inside the agent loop. Worker lifecycle is
   the operator's concern, not yours.
 
-  Convention: source files live in `workspace/<op_name>_ref.py` and
-  `workspace/<op_name>_kernel.py`.
+  Convention: source files live in `workspace/<op_name>_kernel.py`
+  (editable kernel), `workspace/<op_name>_test.py` (pytest-style
+  correctness test), and `workspace/<op_name>_perf.py` (perf script
+  that prints both `triton: median=X.XXms` and `cann: median=X.XXms`).
 
 `--output-dir` defaults to `ar_tasks`.
 
@@ -38,7 +40,7 @@ follow the latest `[AR Phase: ...]` message and never stop between phases.
 
 | flags | initial phase |
 |-------|---------------|
-| `--ref X.py --kernel Y.py` | `BASELINE` runs first; OK / KERNEL_FAIL (ref measured) → `PLAN`; INFRA_FAIL / no valid ref → task parks at `BASELINE` with no committed progress, fix env/ref and re-run |
+| `--kernel Y.py --test T.py --perf P.py` | `BASELINE` runs first; OK / KERNEL_FAIL (perf base measured) → `PLAN`; INFRA_FAIL / no valid perf base → task parks at `BASELINE` with no committed progress, fix env/test/perf/worker and re-run |
 
 ## Step 1 — Parse `$ARGUMENTS`
 

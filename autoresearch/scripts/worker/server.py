@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import os
 import sys
@@ -277,10 +276,14 @@ async def run(
     task_id: str = Form(...),
     op_name: str = Form(...),
     timeout: int = Form(_default_eval_timeout()),
-    override_base_us: Optional[float] = Form(None),
-    override_base_per_shape_us: Optional[str] = Form(None),
 ):
-    """Verify + profile in one call.
+    """Verify + profile in one call (new workflow).
+
+    New workflow: the worker runs the user's test script (pytest) and
+    perf script in a single subprocess via `eval_kernel.py
+    --phases test,perf`. No `override_base_us` / `override_base_per_shape_us`
+    form fields — the perf script measures both gen and base every round,
+    so there is no sticky baseline to override.
 
     Device is picked server-side from the queue, used as the DEVICE_ID
     for the eval subprocess, and released in the finally block — clients
@@ -316,17 +319,6 @@ async def run(
                     f"config_yaml={drift.get('config_yaml')}"))
 
     package_bytes = await package.read()
-
-    per_shape: Optional[list] = None
-    if override_base_per_shape_us:
-        try:
-            per_shape = json.loads(override_base_per_shape_us)
-            if not (isinstance(per_shape, list) and per_shape):
-                per_shape = None
-        except Exception as e:
-            logger.warning("[%s] bad override_base_per_shape_us JSON: %s",
-                           task_id, e)
-            per_shape = None
 
     # Stage 1: acquire a device — but race against disconnect so a
     # client that abandons the request while queued doesn't get a
@@ -372,7 +364,7 @@ async def run(
         # if the client disconnects mid-flight.
         eval_task = asyncio.create_task(
             _run_eval_async(package_bytes, task_id, op_name, timeout,
-                            device_id, override_base_us, per_shape))
+                            device_id))
         watch_task = asyncio.create_task(_watch_disconnect(request))
         done, _pending = await asyncio.wait(
             [eval_task, watch_task],
@@ -430,12 +422,13 @@ async def _watch_disconnect(request: Request) -> None:
 # ---------------------------------------------------------------------------
 
 async def _run_eval_async(package_bytes: bytes, task_id: str, op_name: str,
-                          timeout: int, device_id: int,
-                          override_base_us: Optional[float],
-                          override_base_per_shape_us: Optional[list]
-                          ) -> dict:
-    """Extract the package, look up kernel/ref filenames from task.yaml,
-    dispatch to `local_eval_async`. Returns the dict the client expects.
+                          timeout: int, device_id: int) -> dict:
+    """Extract the package, look up kernel/test/perf filenames from
+    task.yaml, dispatch to `local_eval_async`. Returns the dict the
+    client expects.
+
+    New workflow: no `override_base_us` / `override_base_per_shape_us`
+    args — the perf script re-measures base every round.
 
     Mirrors the sync `_run_eval_sync` this replaced; the difference is
     the eval is `await`-ed (so cancellation propagates into the eval
@@ -458,17 +451,17 @@ async def _run_eval_async(package_bytes: bytes, task_id: str, op_name: str,
 
         kernel_file = (py_stem(config.editable_files[0])
                        if config.editable_files else "kernel")
-        ref_file = py_stem(config.ref_file)
+        test_file = config.test_file
+        perf_file = config.perf_file
 
         verify_resp, profile_resp = await local_eval_async(
             task_dir=tmp,
             op_name=op_name,
             kernel_file=kernel_file,
-            ref_file=ref_file,
+            test_file=test_file,
+            perf_file=perf_file,
             timeout=timeout,
             device_id=device_id,
-            override_base_time_us=override_base_us,
-            override_base_per_shape_us=override_base_per_shape_us,
         )
         return {
             "device_id": device_id,

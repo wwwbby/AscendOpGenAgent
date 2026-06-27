@@ -5,16 +5,16 @@ skill modules / utils ride along on the worker side — the package only
 needs the per-task artifacts:
 
   - task.yaml                  (always)
-  - ref_file                   (config.ref_file, default reference.py)
   - editable_files[*]          (kernel.py and any aux files in
                                 config.editable_files)
-  - data_files[*]              (sibling files the ref reads at runtime —
-                                NPUKernelBench-style `<op>.json` shape
-                                lists, sglang-style `ref.pt` output
-                                caches, auxiliary `.py` imports.
+  - test_file                  (pytest-style correctness script)
+  - perf_file                  (perf script printing triton/cann timing)
+  - data_files[*]              (sibling files the kernel/test/perf
+                                scripts read at runtime — shape lists,
+                                output caches, auxiliary `.py` imports.
                                 Declared in task.yaml `data_files:`.
 
-The data_files field is REQUIRED for any ref that reads sibling
+The data_files field is REQUIRED for any script that reads sibling
 files at runtime — there's no reliable static way to detect such
 deps (open() / torch.load() paths can be dynamic), so we ask the
 task author to spell them out.
@@ -26,7 +26,7 @@ import os
 import tarfile
 from typing import Iterable
 
-from .loader import TaskConfig, REF_FILE_DEFAULT
+from .loader import TaskConfig
 
 
 def _add_file(tar: tarfile.TarFile, task_dir: str, name: str,
@@ -34,9 +34,9 @@ def _add_file(tar: tarfile.TarFile, task_dir: str, name: str,
     """Add task_dir/name into the archive at top-level `name`.
 
     Fails fast (ValueError) instead of silently skipping: every file we
-    pack is declared in task.yaml (task.yaml / ref / editable / data_files)
-    and must exist, else the client would ship an incomplete package that
-    surfaces as a confusing ref/kernel failure on the worker.
+    pack is declared in task.yaml (task.yaml / editable / test / perf /
+    data_files) and must exist, else the client would ship an incomplete
+    package that surfaces as a confusing failure on the worker.
     """
     if name in seen:
         return
@@ -51,7 +51,7 @@ def _add_file(tar: tarfile.TarFile, task_dir: str, name: str,
 
 def build_package(task_dir: str, config: TaskConfig,
                   extra_files: Iterable[str] = ()) -> bytes:
-    """Pack task.yaml + ref + editable + data_files + extras into tar.gz.
+    """Pack task.yaml + editable + test + perf + data_files + extras into tar.gz.
 
     `extra_files` is an ad-hoc escape hatch for callers that know about
     additional sibling files outside task.yaml (rare). Normal usage is
@@ -61,7 +61,9 @@ def build_package(task_dir: str, config: TaskConfig,
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         _add_file(tar, task_dir, "task.yaml", seen)
-        _add_file(tar, task_dir, config.ref_file or REF_FILE_DEFAULT, seen)
+        # New workflow: test_file + perf_file replace ref_file.
+        _add_file(tar, task_dir, config.test_file, seen)
+        _add_file(tar, task_dir, config.perf_file, seen)
         for ef in config.editable_files or []:
             _add_file(tar, task_dir, ef, seen)
         for df in config.data_files or []:

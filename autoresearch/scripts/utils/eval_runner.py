@@ -1,28 +1,22 @@
-"""Local subprocess driver for autoresearch eval.
+"""Local subprocess driver for autoresearch eval (new workflow).
 
-Runs the static `eval_kernel.py` per round. Two subprocesses are
-launched in sequence so a kernel-induced SIGKILL / device hang in the
-second cannot prevent ref measurement from landing on disk:
+The new workflow runs a single subprocess: `eval_kernel.py` with
+`--phases test,perf`. Inside that subprocess, eval_kernel runs the
+user's pytest-style test script and the user's perf script, then writes
+a single `.eval_result.json` sidecar.
 
-  1. ref subprocess  — phases=profile_base (loads ref only)
-  2. kernel subprocess — phases=verify,profile_gen (loads ref + kernel;
-     triton JIT cache populated by verify is warm for profile_gen)
-
-When the caller supplies a sticky `override_base_time_us`, step 1 is
-skipped (ref doesn't need re-measuring round-to-round). Earlier the
-two passes lived in ONE subprocess (verify → profile_gen →
-profile_base); a kernel UB overflow or device fault during verify /
-profile_gen would kill the process before profile_base ran, leaving
-`baseline_metric=None` permanently — that's the failure mode this
-split fixes.
+The old workflow split eval into two subprocesses (ref pass + kernel
+pass) so a kernel UB overflow couldn't kill ref timing. The new workflow
+doesn't need that split: the perf script measures both gen (triton
+kernel) and base (CANN reference) in one run, and if the kernel crashes
+the perf script, the test script has already run in the same subprocess
+— we just won't have a base_time that round, and the task stays in
+BASELINE until a round succeeds.
 
 Public surface:
   - detect_local_backend() -> (ok, why)
-  - local_eval(task_dir, op_name, kernel_file, ref_file,
-               timeout, device_id, warmup, repeats,
-               override_base_time_us) -> (verify_resp, profile_resp)
-
-Precision: allclose-style |diff| <= atol + rtol*|ref| per `correctness.py`.
+  - local_eval(task_dir, op_name, kernel_file, test_file, perf_file,
+               timeout, device_id) -> (verify_resp, profile_resp)
 """
 from __future__ import annotations
 
@@ -37,11 +31,9 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Ascend runtime probe
+# Ascend runtime probe (unchanged from old workflow)
 # ---------------------------------------------------------------------------
 
-# Subprocess probe — keeps torch import out of the parent process so a
-# half-broken install can't poison hooks/scaffold/etc.
 _PROBE_SCRIPT = r"""
 import sys
 try:
@@ -63,21 +55,14 @@ print(f"OK: npu devices={n}")
 sys.exit(0)
 """
 
-_DETECT_CACHE: list = []  # holds (ok, why) once probed
+_DETECT_CACHE: list = []
 
 
 def detect_local_backend() -> tuple[bool, str]:
-    """Probe whether this machine can run Ascend NPU eval locally.
-
-    Cached so repeated calls in the same Python process don't pay the
-    subprocess cost. Returns (ok, human-readable reason).
-    """
+    """Probe whether this machine can run Ascend NPU eval locally."""
     if _DETECT_CACHE:
         return _DETECT_CACHE[0]
     probe_env = os.environ.copy()
-    # Windows libiomp5 double-load workaround — same as we set for the
-    # eval subprocess. Without it, torch.import on Windows aborts with OMP
-    # Error #15 and the probe falsely reports the runtime unavailable.
     probe_env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     try:
         r = subprocess.run(
@@ -105,25 +90,18 @@ def _build_env(device_id: int) -> dict:
     env["PYTHONUNBUFFERED"] = "1"
     env["DEVICE_ID"] = str(device_id)
     env["ASCEND_RT_VISIBLE_DEVICES"] = str(device_id)
-    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # Windows libiomp5 dup-load (no-op on Linux)
-    env["PYTHONIOENCODING"] = "utf-8"  # propagates UTF-8 to eval_kernel subproc
+    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 
 def _run_subprocess(cmd: list[str], cwd: str, env: dict,
                     timeout: int) -> tuple[int, str, str]:
-    """subprocess.run wrapper that returns (rc, stdout, stderr).
-
-    Returns rc=124 on timeout (matching the GNU `timeout(1)` convention) and
-    a stderr describing the timeout. Process-group cleanup uses os.setsid
-    on POSIX so a hung kernel can't leave orphan children; on Windows we
-    rely on subprocess's own kill().
-    """
+    """subprocess.run wrapper. Returns (rc, stdout, stderr). rc=124 on
+    timeout."""
     popen_kwargs = {
-        "cwd": cwd,
-        "env": env,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
+        "cwd": cwd, "env": env,
+        "stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
     }
     if hasattr(os, "setsid"):
         popen_kwargs["preexec_fn"] = os.setsid
@@ -131,7 +109,6 @@ def _run_subprocess(cmd: list[str], cwd: str, env: dict,
         proc = subprocess.Popen(cmd, **popen_kwargs)
     except Exception as e:
         return 1, "", f"failed to launch eval: {e}"
-
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
         return (proc.returncode or 0,
@@ -156,9 +133,13 @@ def _run_subprocess(cmd: list[str], cwd: str, env: dict,
             stdout, stderr = b"", b""
         return (124,
                 (stdout or b"").decode(errors="replace"),
-                (stderr or b"").decode(errors="replace") +
-                f"\n[eval_runner] eval timed out after {timeout}s")
+                (stderr or b"").decode(errors="replace")
+                + f"\n[eval_runner] eval timed out after {timeout}s")
 
+
+# ---------------------------------------------------------------------------
+# Sidecar helpers
+# ---------------------------------------------------------------------------
 
 def _avg_us(d: Optional[dict]) -> Optional[float]:
     if not isinstance(d, dict):
@@ -168,10 +149,6 @@ def _avg_us(d: Optional[dict]) -> Optional[float]:
         return float(v)
     return None
 
-
-# ---------------------------------------------------------------------------
-# Verify + profile (two subprocesses: ref first, then kernel)
-# ---------------------------------------------------------------------------
 
 def _read_sidecar(path: str) -> dict:
     if not os.path.isfile(path):
@@ -184,184 +161,100 @@ def _read_sidecar(path: str) -> dict:
         return {}
 
 
+# ---------------------------------------------------------------------------
+# local_eval (single subprocess)
+# ---------------------------------------------------------------------------
+
 def local_eval(task_dir: str, op_name: str,
-               kernel_file: str, ref_file: str,
+               kernel_file: str, test_file: str, perf_file: str,
                timeout: int, device_id: int = 0,
-               warmup: Optional[int] = None, repeats: Optional[int] = None,
-               override_base_time_us: Optional[float] = None,
-               override_base_per_shape_us: Optional[list] = None,
-               ) -> tuple[dict, dict]:
-    """Run eval_kernel.py in two passes (see module docstring):
-      ref pass:    --phases profile_base
-      kernel pass: --phases verify,profile_gen
-    Then merge per-phase sidecars and assemble (verify_resp,
-    profile_resp) in the shape `_assemble_eval_result` consumes.
+               **_legacy) -> tuple[dict, dict]:
+    """Run eval_kernel.py once with --phases test,perf.
 
-    When `override_base_time_us` is supplied (sticky baseline), the
-    ref pass is skipped — ref doesn't need re-measuring round-to-round.
+    The perf script measures both gen (triton kernel) and base (CANN
+    reference) timing in the same subprocess. No sticky baseline, no
+    ref pass — every eval re-measures everything.
 
-    override_base_per_shape_us: when provided alongside the aggregate,
-    profile_resp gets a synthesized base profile artifact that includes
-    per_shape entries — keeps speedup_vs_ref aggregation (geomean of
-    per-shape ratios) consistent across sticky-baseline rounds and the
-    initial round that actually measured ref.
+    Returns (verify_resp, profile_resp) in the shape
+    `eval_assemble.assemble_eval_result` consumes.
+
+    `_legacy` swallows warmup/repeats/override_base_* kwargs that old
+    callers still pass — they're ignored in the new workflow.
     """
-    # config.yaml is the single source for measurement counts; settings.py
-    # is a sibling under utils/. None means "use config".
-    from .settings import eval_warmup, eval_repeats
-    if warmup is None:
-        warmup = eval_warmup()
-    if repeats is None:
-        repeats = eval_repeats()
-
-    skip_base = (override_base_time_us is not None
-                 and override_base_time_us > 0
-                 and override_base_time_us < float("inf"))
-
-    # __file__ is scripts/utils/eval_runner.py — climb one level then
-    # dive into engine/ where eval_kernel.py lives post-restructure.
     scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     eval_script = os.path.join(scripts_dir, "engine", "eval_kernel.py")
     abs_task = os.path.abspath(task_dir)
     env = _build_env(device_id)
 
-    # Distinct sidecars per pass so the second pass can't overwrite the
-    # first. Both files persist under task_dir for forensics; downstream
-    # code reads from in-memory verify_resp / profile_resp, not the
-    # files.
-    ref_path = os.path.join(abs_task, ".eval_result_ref.json")
-    kernel_path = os.path.join(abs_task, ".eval_result_kernel.json")
-    for p in (ref_path, kernel_path):
-        try:
-            os.remove(p)
-        except FileNotFoundError:
-            pass
+    sidecar_path = os.path.join(abs_task, ".eval_result.json")
+    try:
+        os.remove(sidecar_path)
+    except FileNotFoundError:
+        pass
 
-    def _run_phases(phases: list[str], out_path: str) -> tuple[int, str]:
-        cmd = [
-            sys.executable, eval_script,
-            "--task-dir", abs_task,
-            "--op-name", op_name,
-            "--kernel-file", kernel_file,
-            "--ref-file", ref_file,
-            "--device-id", str(device_id),
-            "--warmup", str(warmup),
-            "--repeats", str(repeats),
-            "--phases", ",".join(phases),
-            "--output", out_path,
-        ]
-        rc, stdout, stderr = _run_subprocess(
-            cmd, cwd=task_dir, env=env, timeout=timeout)
-        log = (stdout + ("\n" + stderr if stderr else "")).strip()
-        return rc, log
+    cmd = [
+        sys.executable, eval_script,
+        "--task-dir", abs_task,
+        "--op-name", op_name,
+        "--kernel-file", kernel_file,
+        "--test-file", test_file,
+        "--perf-file", perf_file,
+        "--device-id", str(device_id),
+        "--phases", "test,perf",
+        "--timeout", str(timeout),
+        "--output", sidecar_path,
+    ]
+    rc, stdout, stderr = _run_subprocess(
+        cmd, cwd=task_dir, env=env, timeout=timeout * 2 + 30)
+    log = (stdout + ("\n" + stderr if stderr else "")).strip()
 
-    # --- Pass 1: ref-only subprocess (immune to kernel-induced death) ----
-    if skip_base:
-        ref_log = ""
-        ref_payload: dict = {}
-    else:
-        _, ref_log = _run_phases(["profile_base"], ref_path)
-        ref_payload = _read_sidecar(ref_path)
-
-    # --- Pass 2: kernel subprocess (verify + profile_gen, JIT warm) -------
-    # rc here is the kernel-side returncode — the one downstream readers
-    # treat as authoritative (verify_resp.returncode). A ref crash
-    # surfaces via verify_resp.error_source == "ref" / missing base_time.
-    rc, kernel_log = _run_phases(["verify", "profile_gen"], kernel_path)
-    kernel_payload = _read_sidecar(kernel_path)
-
-    return _assemble_response(
-        ref_payload, kernel_payload, rc, ref_log, kernel_log,
-        skip_base, override_base_time_us, override_base_per_shape_us,
-    )
+    payload = _read_sidecar(sidecar_path)
+    return _assemble_response(payload, rc, log)
 
 
-def _assemble_response(ref_payload: dict, kernel_payload: dict, rc: int,
-                       ref_log: str, kernel_log: str, skip_base: bool,
-                       override_base_time_us: Optional[float],
-                       override_base_per_shape_us: Optional[list]
+def _assemble_response(payload: dict, rc: int, log: str
                        ) -> tuple[dict, dict]:
-    """Shared response builder for both `local_eval` (sync) and
-    `local_eval_async`. Pulled out so the two drivers only differ in the
-    subprocess spawn loop; everything downstream of the sidecar reads
-    is identical.
-
-    Returns (verify_resp, profile_resp) in the shape
-    `task_config.eval_assemble.assemble_eval_result` consumes.
-    """
+    """Build (verify_resp, profile_resp) from the single sidecar."""
     from .json_io import sanitize_floats
 
-    log_combined = "\n".join(s for s in (ref_log, kernel_log) if s).strip()
-    verify_block = kernel_payload.get("verify")
-    gen_block = kernel_payload.get("profile_gen")
-    base_block = ref_payload.get("profile_base") if not skip_base else None
+    verify_block = payload.get("verify") or {}
+    gen_block = payload.get("profile_gen")
+    base_block = payload.get("profile_base")
 
-    verify_correct = (isinstance(verify_block, dict)
-                      and bool(verify_block.get("correctness")))
-    # error_source: "ref" | "kernel" | None. run_verify tags it on the
-    # verify_block; eval_client reads it via verify_resp to decide
-    # ref-broken vs kernel-broken (drives INFRA_FAIL vs KERNEL_FAIL).
-    error_source = (verify_block.get("error_source")
-                    if isinstance(verify_block, dict) else None)
+    verify_correct = bool(verify_block.get("correctness"))
+    error_source = verify_block.get("error_source") if not verify_correct else None
+
     verify_resp = {
         "success": verify_correct,
-        "log": log_combined,
+        "log": log,
         "artifacts": {},
         "returncode": rc,
         "error_source": error_source,
-        # Pass the full verify_block through so eval_client can pull
-        # failed_indices / per_case / diagnostics for DIAGNOSE context
-        # without re-parsing the log JSON tail (eval_kernel writes its
-        # structured result to .eval_result.json, not to stderr).
         "verify_block": verify_block if isinstance(verify_block, dict) else {},
     }
 
     artifacts: dict[str, str] = {}
-    if skip_base and isinstance(override_base_per_shape_us, list) and override_base_per_shape_us:
-        # Materialise a base profile artifact from the sticky per-shape
-        # baseline so _assemble_eval_result sees per_base alongside
-        # per_gen — speedup_vs_ref then computes as geomean of per-shape
-        # ratios just like the round-0 baseline did.
-        synth_per_shape = [{"avg_time_us": float(v)}
-                           for v in override_base_per_shape_us]
-        synth_avg = sum(s["avg_time_us"] for s in synth_per_shape) / len(synth_per_shape)
-        artifacts["base_profile_result.json"] = json.dumps(sanitize_floats({
-            "avg_time_us": synth_avg,
-            "per_shape": synth_per_shape,
-            "sticky": True,
-        }))
-    elif isinstance(base_block, dict):
+    if isinstance(base_block, dict):
         artifacts["base_profile_result.json"] = json.dumps(
             sanitize_floats(base_block))
     if isinstance(gen_block, dict):
         artifacts["generation_profile_result.json"] = json.dumps(
             sanitize_floats(gen_block))
 
-    base_time = (float(override_base_time_us) if skip_base
-                 else _avg_us(base_block))
+    base_time = _avg_us(base_block)
     gen_time = _avg_us(gen_block)
     profile_resp = {
         "success": gen_time is not None or base_time is not None,
-        "log": log_combined,
+        "log": log,
         "artifacts": artifacts,
         "gen_time": gen_time,
         "base_time": base_time,
     }
-
-    if skip_base:
-        # Stay shape-compatible with old log: keep the explicit hint so the
-        # round transcript still records why no base-profile artifact landed.
-        profile_resp["log"] = (
-            f"[eval_runner] sticky baseline override = "
-            f"{override_base_time_us:.2f} us; profile_base skipped\n"
-            + profile_resp["log"]
-        )
-
     return verify_resp, profile_resp
 
 
 # ---------------------------------------------------------------------------
-# Async sibling — cancellable subprocess spawn for the worker daemon
+# Async sibling (worker daemon)
 # ---------------------------------------------------------------------------
 
 import asyncio  # noqa: E402
@@ -369,9 +262,6 @@ import signal  # noqa: E402
 
 
 def _killpg_quiet(proc) -> None:
-    """SIGTERM the subprocess group; swallow ProcessLookupError etc. POSIX
-    only — on Windows asyncio subprocess doesn't get a process group and
-    proc.terminate() suffices."""
     try:
         if hasattr(os, "killpg"):
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -383,12 +273,6 @@ def _killpg_quiet(proc) -> None:
 
 async def _run_subprocess_async(cmd: list[str], cwd: str, env: dict,
                                 timeout: int) -> tuple[int, str, str]:
-    """Async sibling of `_run_subprocess`. Same contract — returns
-    `(rc, stdout, stderr)`, rc=124 on timeout — but the subprocess is
-    spawned via `asyncio.create_subprocess_exec` so the caller can
-    `task.cancel()` and have us SIGTERM the whole process tree (eval
-    has its own process group via `os.setsid`).
-    """
     preexec = os.setsid if hasattr(os, "setsid") else None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -399,7 +283,6 @@ async def _run_subprocess_async(cmd: list[str], cwd: str, env: dict,
         )
     except Exception as e:
         return 1, "", f"failed to launch eval: {e}"
-
     try:
         try:
             stdout_b, stderr_b = await asyncio.wait_for(
@@ -420,9 +303,6 @@ async def _run_subprocess_async(cmd: list[str], cwd: str, env: dict,
                     stderr_b.decode(errors="replace")
                     + f"\n[eval_runner] eval timed out after {timeout}s")
     except asyncio.CancelledError:
-        # Outer task was cancelled (e.g. worker handler saw client
-        # disconnect). Tear the subprocess down and re-raise so the
-        # cancellation propagates up to the device-release `finally`.
         _killpg_quiet(proc)
         try:
             await asyncio.wait_for(proc.communicate(), timeout=5)
@@ -432,76 +312,37 @@ async def _run_subprocess_async(cmd: list[str], cwd: str, env: dict,
 
 
 async def local_eval_async(task_dir: str, op_name: str,
-                           kernel_file: str, ref_file: str,
+                           kernel_file: str, test_file: str, perf_file: str,
                            timeout: int, device_id: int = 0,
-                           warmup: Optional[int] = None, repeats: Optional[int] = None,
-                           override_base_time_us: Optional[float] = None,
-                           override_base_per_shape_us: Optional[list] = None,
-                           ) -> tuple[dict, dict]:
-    """Async sibling of `local_eval`. Same arguments, same return shape;
-    the only behavioural difference is that the eval subprocesses are
-    spawned via `_run_subprocess_async`, so cancellation of the outer
-    asyncio task (e.g. worker handler on HTTP client disconnect) tears
-    the eval down promptly rather than leaving a zombie that holds the
-    device until the eval finishes.
-    """
-    # Was `from settings import …` (absolute); broke every fresh worker
-    # boot because worker.server only adds `scripts/` to sys.path, no
-    # top-level `settings.py` exists. Sync sibling at line 210 already
-    # used the relative form — keep them in lockstep.
-    from .settings import eval_warmup, eval_repeats
-    if warmup is None:
-        warmup = eval_warmup()
-    if repeats is None:
-        repeats = eval_repeats()
-
-    skip_base = (override_base_time_us is not None
-                 and override_base_time_us > 0
-                 and override_base_time_us < float("inf"))
-
+                           **_legacy) -> tuple[dict, dict]:
+    """Async sibling of `local_eval`. Same args/return; subprocess
+    spawned via asyncio so worker cancellation tears it down promptly."""
     scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     eval_script = os.path.join(scripts_dir, "engine", "eval_kernel.py")
     abs_task = os.path.abspath(task_dir)
     env = _build_env(device_id)
 
-    ref_path = os.path.join(abs_task, ".eval_result_ref.json")
-    kernel_path = os.path.join(abs_task, ".eval_result_kernel.json")
-    for p in (ref_path, kernel_path):
-        try:
-            os.remove(p)
-        except FileNotFoundError:
-            pass
+    sidecar_path = os.path.join(abs_task, ".eval_result.json")
+    try:
+        os.remove(sidecar_path)
+    except FileNotFoundError:
+        pass
 
-    async def _run_phases(phases: list[str], out_path: str) -> tuple[int, str]:
-        cmd = [
-            sys.executable, eval_script,
-            "--task-dir", abs_task,
-            "--op-name", op_name,
-            "--kernel-file", kernel_file,
-            "--ref-file", ref_file,
-            "--device-id", str(device_id),
-            "--warmup", str(warmup),
-            "--repeats", str(repeats),
-            "--phases", ",".join(phases),
-            "--output", out_path,
-        ]
-        rc, stdout, stderr = await _run_subprocess_async(
-            cmd, cwd=task_dir, env=env, timeout=timeout)
-        log = (stdout + ("\n" + stderr if stderr else "")).strip()
-        return rc, log
+    cmd = [
+        sys.executable, eval_script,
+        "--task-dir", abs_task,
+        "--op-name", op_name,
+        "--kernel-file", kernel_file,
+        "--test-file", test_file,
+        "--perf-file", perf_file,
+        "--device-id", str(device_id),
+        "--phases", "test,perf",
+        "--timeout", str(timeout),
+        "--output", sidecar_path,
+    ]
+    rc, stdout, stderr = await _run_subprocess_async(
+        cmd, cwd=task_dir, env=env, timeout=timeout * 2 + 30)
+    log = (stdout + ("\n" + stderr if stderr else "")).strip()
 
-    if skip_base:
-        ref_log = ""
-        ref_payload: dict = {}
-    else:
-        _, ref_log = await _run_phases(["profile_base"], ref_path)
-        ref_payload = _read_sidecar(ref_path)
-
-    rc, kernel_log = await _run_phases(
-        ["verify", "profile_gen"], kernel_path)
-    kernel_payload = _read_sidecar(kernel_path)
-
-    return _assemble_response(
-        ref_payload, kernel_payload, rc, ref_log, kernel_log,
-        skip_base, override_base_time_us, override_base_per_shape_us,
-    )
+    payload = _read_sidecar(sidecar_path)
+    return _assemble_response(payload, rc, log)

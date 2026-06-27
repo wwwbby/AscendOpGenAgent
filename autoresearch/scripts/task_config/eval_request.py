@@ -1,28 +1,19 @@
 """Build canonical eval requests before invoking the subprocess.
 
-This module owns request-time decisions: case-count probing, timeout
-scaling, and sticky baseline override lookup. It returns data only;
-the runner executes and the assembler interprets the response.
+New workflow: the user supplies test (pytest) + perf scripts. The perf
+script measures both gen (triton kernel) and base (CANN reference) timing
+on every eval, so sticky baseline reuse is gone — there's no separate
+ref pass to skip. Case-count probing is gone too: the test/perf scripts
+manage their own case matrices internally.
 
-AOA only has a local-subprocess transport (no HTTP worker), so this
-module's surface stays small — one factory function and a few helpers.
+This module now owns only timeout scaling. It returns data only; the
+runner executes and the assembler interprets the response.
 """
 from __future__ import annotations
 
-import os
-import sys
 from dataclasses import dataclass
-from typing import Optional
 
 from .loader import TaskConfig
-
-_scripts_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _scripts_dir not in sys.path:
-    sys.path.insert(0, _scripts_dir)
-
-from utils.baseline_anchor import (  # noqa: E402
-    current_fingerprint, sticky_override_from_progress,
-)
 
 
 @dataclass(frozen=True)
@@ -31,130 +22,42 @@ class EvalRequest:
     config: TaskConfig
     num_cases: int
     timeout: int
-    override_base_us: Optional[float] = None
-    override_base_per_shape_us: Optional[list[float]] = None
+    # Retained as None for API back-compat with callers that still read
+    # these fields (worker HTTP form, _log_request). Always None in the
+    # new workflow — every eval re-measures the base via the perf script.
+    override_base_us: float | None = None
+    override_base_per_shape_us: list[float] | None = None
 
     @property
     def sticky(self) -> bool:
-        return self.override_base_us is not None
+        return False  # new workflow: no sticky baseline
 
     def sticky_note(self) -> str:
-        if self.override_base_us is None:
-            return ""
-        if self.override_base_per_shape_us:
-            extra = f" (+ per-shape {len(self.override_base_per_shape_us)})"
-        else:
-            extra = " (aggregate only)"
-        return f"sticky baseline override={self.override_base_us:.2f} us{extra}"
-
-
-def _last_known_cases(task_dir: str) -> Optional[int]:
-    """Reuse the case count recorded in a prior round's baseline
-    fingerprint. A dev-side probe failure (host without torch/CANN) must
-    not silently collapse num_cases to 1: that both under-scales the eval
-    timeout and invalidates the sticky baseline fingerprint, forcing a
-    needless ref re-measure on every remote round."""
-    try:
-        from phase_machine import load_progress  # type: ignore
-        progress = load_progress(task_dir) or {}
-        fp = progress.get("baseline_fingerprint") or {}
-        n = int(fp.get("num_cases", 0))
-        return n if n > 0 else None
-    except Exception:
-        return None
-
-
-def count_ref_cases(task_dir: str, config: TaskConfig) -> int:
-    """Resolve the number of input cases — used to scale eval_timeout and
-    the sticky baseline fingerprint.
-
-    Resolution order:
-      1. `config.num_cases` (task.yaml `eval.num_cases`) when set — lets
-         dev hosts without torch/CANN scale correctly with no ref import.
-      2. Probe the ref module: import + input_groups.resolve, duck-typing
-         between get_input_groups (multi-shape, NPUKernelBench) and
-         get_inputs (single-shape collapsed to N=1).
-      3. On probe failure, reuse the last-known count from the stored
-         baseline fingerprint rather than collapsing to 1.
-      4. Only when nothing is known: fall back to 1 (single-shape).
-    """
-    if getattr(config, "num_cases", 0):
-        return max(int(config.num_cases), 1)
-
-    ref_path = os.path.join(task_dir, config.ref_file)
-    if not os.path.isfile(ref_path):
-        return _last_known_cases(task_dir) or 1
-    ref_dir = os.path.dirname(ref_path) or "."
-    sys_path_added = ref_dir not in sys.path
-    if sys_path_added:
-        sys.path.insert(0, ref_dir)
-    try:
-        import importlib.util
-        from utils.input_groups import resolve as _resolve  # type: ignore
-        spec = importlib.util.spec_from_file_location(
-            f"_count_ref_{config.name}", ref_path)
-        if spec is None or spec.loader is None:
-            return _last_known_cases(task_dir) or 1
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return max(len(_resolve(mod)), 1)
-    except Exception as e:
-        fallback = _last_known_cases(task_dir)
-        recovered = (f"reusing last-known num_cases={fallback}" if fallback
-                     else "falling back to num_cases=1")
-        print(f"[eval_request] WARN: case-count probe failed "
-              f"({type(e).__name__}: {e}); {recovered}. Set "
-              f"`eval.num_cases` in task.yaml to avoid importing the ref "
-              f"on hosts without torch/CANN.", file=sys.stderr)
-        return fallback or 1
-    finally:
-        if sys_path_added:
-            try:
-                sys.path.remove(ref_dir)
-            except ValueError:
-                pass
+        return ""
 
 
 def effective_timeout(config: TaskConfig, num_cases: int) -> int:
-    """config.eval_timeout is the budget per shape; scale by case count."""
-    return int(config.eval_timeout) * max(int(num_cases), 1)
-
-
-def override_base_from_progress(
-        task_dir: str,
-        num_cases: int,
-        ) -> Optional[tuple[float, Optional[list[float]]]]:
-    """Return sticky baseline override when the stored anchor is comparable."""
-    try:
-        from phase_machine import load_progress  # type: ignore
-        progress = load_progress(task_dir) or {}
-    except Exception:
-        return None
-
-    fingerprint = current_fingerprint(num_cases)
-    decision = sticky_override_from_progress(progress, fingerprint)
-    if decision.mismatch:
-        print(f"[eval_request] sticky baseline invalidated: "
-              f"fingerprint mismatch {decision.mismatch}; "
-              f"will re-measure ref", file=sys.stderr)
-    if decision.override is None:
-        return None
-    return decision.override.metric, decision.override.per_shape_us
+    """config.eval_timeout is the budget for the eval subprocess. In the
+    new workflow a single subprocess runs both the test script (pytest)
+    and the perf script, so we no longer scale by num_cases — the test
+    script manages its own case matrix and the wall-clock cost is bounded
+    by the script itself, not by autoresearch's case count."""
+    return int(config.eval_timeout)
 
 
 def build_eval_request(task_dir: str, config: TaskConfig) -> EvalRequest:
-    num_cases = count_ref_cases(task_dir, config)
+    # num_cases is informational in the new workflow (test/perf scripts
+    # manage their own case matrices). We pass config.num_cases through
+    # unchanged so downstream code that reads it (e.g. timeout scaling
+    # logs, history records) keeps working.
+    num_cases = max(int(getattr(config, "num_cases", 1) or 1), 1)
     timeout = effective_timeout(config, num_cases)
-    override = override_base_from_progress(task_dir, num_cases)
-    if override is None:
-        override_base_us, override_per_shape = None, None
-    else:
-        override_base_us, override_per_shape = override
     return EvalRequest(
         task_dir=task_dir,
         config=config,
         num_cases=num_cases,
         timeout=timeout,
-        override_base_us=override_base_us,
-        override_base_per_shape_us=override_per_shape,
+        # Always None: perf script re-measures base on every eval.
+        override_base_us=None,
+        override_base_per_shape_us=None,
     )

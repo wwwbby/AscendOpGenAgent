@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 """
-Task directory scaffolder for Claude Code autoresearch.
+Task directory scaffolder for Claude Code autoresearch (new workflow).
 
 Zero external dependency. Creates a self-contained task directory with:
   - task.yaml (config)
-  - reference.py (correctness baseline; AST-checked via utils.ref_ast.
-    validate_ref before scaffold copies it. Runtime correctness is
-    validated by --run-baseline whose verify routine tags error_source.)
   - kernel.py (editable seed; written from the user's --kernel file)
+  - <test_file> (pytest-style correctness script; user-supplied)
+  - <perf_file> (perf script printing triton/cann timing; user-supplied)
   - .ar_state/ (progress tracking)
   - .git/ (baseline commit)
 
+The new workflow drops the ref.py contract. Instead the user supplies
+three files: a kernel under optimization, a pytest test script, and a
+perf script that prints `triton:  median=X.XXms` + `cann:    median=X.XXms`.
+
 Usage:
-    # NOTE: --devices values below are placeholders; pass the actual free
-    # device id at invocation time.
-
-    # Local eval (arch auto-derived via npu-smi):
-    python scripts/scaffold.py --ref reference.py --kernel kernel.py --op-name my_op --devices <DEV>
-
-    # Custom output directory:
-    python scripts/scaffold.py --ref reference.py --kernel kernel.py --op-name my_op --devices <DEV> --output-dir /tmp/tasks
+    python scripts/scaffold.py --kernel kernel.py --test test_op.py --perf perf_op.py --op-name my_op --devices <DEV>
 
 Output (last line of stdout):
     {"task_dir": "/absolute/path/to/task_dir", "status": "ok"}
@@ -36,18 +32,11 @@ import uuid
 import yaml
 
 
-# ---------------------------------------------------------------------------
-# Reference validation — delegated to the standalone library module so
-# phase_machine.validators can call the same rule without importing this
-# CLI script. The local re-export keeps callers that imported
-# `scaffold.validate_ref` working.
-# ---------------------------------------------------------------------------
-from utils.ref_ast import validate_ref  # noqa: E402, F401  (re-export)
 from utils.settings import (  # noqa: E402
     default_max_rounds, default_eval_timeout, default_metric,
     default_code_checker_enabled,
 )
-from task_config import REF_FILE_DEFAULT  # noqa: E402
+from task_config import TEST_FILE_DEFAULT, PERF_FILE_DEFAULT  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -56,8 +45,9 @@ from task_config import REF_FILE_DEFAULT  # noqa: E402
 
 def scaffold_task_dir(
     *,
-    ref_code: str,
     kernel_code: str,
+    test_code: str,
+    perf_code: str,
     op_name: str,
     desc: str = "",
     arch: str = "",
@@ -66,18 +56,29 @@ def scaffold_task_dir(
     eval_timeout: int | None = None,
     output_dir: str | None = None,
     editable_filename: str = "kernel.py",
+    test_filename: str | None = None,
+    perf_filename: str | None = None,
     code_checker_enabled: bool | None = None,
-    ref_source_path: str | None = None,
+    kernel_source_path: str | None = None,
     worker_url: str = "",
 ) -> str:
-    """Create task directory with all files. Returns absolute path."""
+    """Create task directory with all files. Returns absolute path.
+
+    New workflow: writes kernel + test + perf (no ref). The test/perf
+    filenames are derived from the user's source filenames if provided,
+    else fall back to TEST_FILE_DEFAULT / PERF_FILE_DEFAULT.
+    """
     if max_rounds is None:
         max_rounds = default_max_rounds()
     if eval_timeout is None:
         eval_timeout = default_eval_timeout()
     if code_checker_enabled is None:
         code_checker_enabled = default_code_checker_enabled()
-    # Determine base directory
+    if test_filename is None:
+        test_filename = TEST_FILE_DEFAULT
+    if perf_filename is None:
+        perf_filename = PERF_FILE_DEFAULT
+
     if output_dir:
         base_dir = output_dir
     else:
@@ -87,75 +88,49 @@ def scaffold_task_dir(
     task_dir = os.path.join(base_dir, dir_name)
     os.makedirs(task_dir)
 
-    # Write reference.py and the seed kernel.py from the user's files.
-    _write(task_dir, REF_FILE_DEFAULT, ref_code)
+    # Write kernel + test + perf from the user's files.
     _write(task_dir, editable_filename, kernel_code)
+    _write(task_dir, test_filename, test_code)
+    _write(task_dir, perf_filename, perf_code)
 
-    # NPUKernelBench-style refs read shape lists from a sibling JSON via
-    # `os.path.join(os.path.dirname(__file__), "<basename>.json")`;
-    # sglang-style refs torch.load() a sibling `.pt` cache the same way.
-    # Copy these next to ref.py inside task_dir (preserving names so
-    # `dirname(__file__)` resolution still hits them) and remember the
-    # basenames — they're written into task.yaml `data_files:` below so
-    # the remote package builder ships them too. Without this, local
-    # eval works (the file is on disk next to ref.py) but remote eval
-    # FileNotFoundErrors on the worker.
+    # Sibling data files (e.g. .json shape lists, .pt caches) that the
+    # kernel/test/perf scripts may read at runtime. Scan the kernel's
+    # source directory for files matching the kernel's stem prefix.
     discovered_data_files: list[str] = []
-    if ref_source_path:
+    if kernel_source_path:
         try:
             import shutil as _shutil
-            ref_dir_src = os.path.dirname(os.path.abspath(ref_source_path))
-            ref_stem = os.path.splitext(os.path.basename(ref_source_path))[0]
-            # Match only the current ref's siblings — NPUKernelBench's
-            # level0/ has dozens of ops, each with its own `<name>.json`
-            # + `<name>_all_case.json`. Without this filter, scaffold
-            # would copy every neighbouring op's case file.
-            for fname in sorted(os.listdir(ref_dir_src)):
+            src_dir = os.path.dirname(os.path.abspath(kernel_source_path))
+            kernel_stem = os.path.splitext(
+                os.path.basename(kernel_source_path))[0]
+            for fname in sorted(os.listdir(src_dir)):
                 if fname.startswith("."):
                     continue
                 ext = os.path.splitext(fname)[1].lower()
                 if ext not in (".json", ".pt", ".npz"):
                     continue
-                stem, ext = os.path.splitext(fname)
-                if stem != ref_stem and not stem.startswith(ref_stem + "_"):
+                stem, _ = os.path.splitext(fname)
+                # Match files whose stem is the kernel stem or starts
+                # with "<kernel_stem>_". This avoids copying every
+                # neighbouring op's data file.
+                if stem != kernel_stem and not stem.startswith(kernel_stem + "_"):
                     continue
-                src = os.path.join(ref_dir_src, fname)
+                src = os.path.join(src_dir, fname)
                 if not os.path.isfile(src):
                     continue
-                # If the sidecar's stem EXACTLY matches the original ref
-                # stem, the ref likely derives its JSON path from `__file__`
-                # (the convention-compliant case). Since scaffold renames
-                # the ref to REF_FILE_DEFAULT (`reference.py`), the
-                # `os.path.dirname(__file__) + basename(stem) + '.json'`
-                # path resolves to `<REF_STEM>.json` in task_dir at runtime
-                # — so we must copy the sidecar under that renamed name
-                # too, else baseline hits FileNotFoundError. Other refs
-                # (those that hardcode their sidecar filename) keep the
-                # original filename.
-                if stem == ref_stem:
-                    dest_name = os.path.splitext(REF_FILE_DEFAULT)[0] + ext
-                else:
-                    dest_name = fname
-                _shutil.copy(src, os.path.join(task_dir, dest_name))
-                discovered_data_files.append(dest_name)
+                _shutil.copy(src, os.path.join(task_dir, fname))
+                discovered_data_files.append(fname)
         except Exception as _e:
             print(f"[scaffold] WARNING: sidecar data file copy failed: {_e}",
                   file=sys.stderr)
 
-    # Generate task.yaml — only fields that vary per-task. dsl /
-    # framework / backend are constants (triton_ascend / torch / ascend)
-    # baked into TaskConfig; not written here.
-    # Probe the ref's case count once, here at scaffold time (cwd has the
-    # ref + data_files already written above). Pin it into task.yaml
-    # `eval.num_cases` so later rounds — including a first remote baseline
-    # on a dev host that can't import the ref — scale the eval timeout and
-    # sticky fingerprint correctly instead of falling back to 1. Probe
-    # failure (no torch/CANN here) just omits the field; eval_request then
-    # falls back to its own probe / fingerprint reuse as before.
-    eval_block = {"timeout": eval_timeout}
-    num_cases = _probe_num_cases(task_dir, REF_FILE_DEFAULT)
-    if num_cases and num_cases > 1:
-        eval_block["num_cases"] = num_cases
+    # Generate task.yaml. The new workflow puts test_file + perf_file
+    # under the `eval` block (where loader expects them).
+    eval_block = {
+        "timeout": eval_timeout,
+        "test_file": test_filename,
+        "perf_file": perf_filename,
+    }
 
     task_yaml = {
         "name": op_name,
@@ -166,13 +141,9 @@ def scaffold_task_dir(
         "metric": {
             "primary": default_metric()["primary"],
             "lower_is_better": default_metric()["lower_is_better"],
-            # Pin the threshold too: loader falls back to the live global
-            # config when it's absent, so an unpinned task would silently
-            # change KEEP/DISCARD behaviour if the global default is retuned.
             "improvement_threshold": default_metric()["improvement_threshold"],
         },
         "agent": {
-            "ref_file": REF_FILE_DEFAULT,
             "max_rounds": max_rounds,
         },
     }
@@ -184,39 +155,15 @@ def scaffold_task_dir(
     if discovered_data_files:
         task_yaml["data_files"] = discovered_data_files
 
-    # Always pin the task-level value (code_checker_enabled is already
-    # resolved to a concrete bool above). loader falls back to the live
-    # global config when this field is absent, so an unpinned task would
-    # silently flip behaviour if the global default is retuned — same
-    # pinning rationale as eval.timeout / metric.improvement_threshold.
-    # quick_check.py and phase_machine.validate_kernel honor this field.
     task_yaml["code_checker"] = {"enabled": bool(code_checker_enabled)}
 
     yaml_content = yaml.dump(task_yaml, default_flow_style=False, allow_unicode=True)
     _write(task_dir, "task.yaml", yaml_content)
 
-    # Create .ar_state directory
     os.makedirs(os.path.join(task_dir, ".ar_state"), exist_ok=True)
-
-    # Git init + baseline commit
     _git_init(task_dir)
 
     return os.path.abspath(task_dir)
-
-
-def _probe_num_cases(task_dir: str, ref_file: str):
-    """Best-effort case count for task.yaml `eval.num_cases`, using the
-    exact runtime resolver (task_config.eval_request.count_ref_cases) so
-    scaffold and eval agree. Returns the count, or None if the ref can't
-    be imported here (e.g. no torch on the dev host) — the caller then
-    simply omits the field and lets eval_request probe at run time."""
-    try:
-        from task_config.loader import TaskConfig
-        from task_config.eval_request import count_ref_cases
-        probe_cfg = TaskConfig(name="_probe", ref_file=ref_file)
-        return count_ref_cases(task_dir, probe_cfg)
-    except Exception:
-        return None
 
 
 def _write(task_dir: str, rel_path: str, content: str):
@@ -257,10 +204,12 @@ def _make_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Scaffold a task directory for Claude Code autoresearch",
     )
-    parser.add_argument("--ref", required=True,
-                        help="Path to reference.py (Model/get_inputs format)")
     parser.add_argument("--kernel", required=True,
-                        help="Path to seed kernel file")
+                        help="Path to seed kernel file (editable)")
+    parser.add_argument("--test", required=True,
+                        help="Path to pytest-style test script")
+    parser.add_argument("--perf", required=True,
+                        help="Path to perf script (prints triton/cann timing)")
     parser.add_argument("--op-name", default=None,
                         help="Operator name (required)")
     # The repo is locked to triton_ascend on Ascend NPU + PyTorch by
@@ -335,18 +284,7 @@ def main():
                           "error": "--op-name is required"}))
         sys.exit(1)
 
-    if not os.path.isfile(args.ref):
-        print(json.dumps({"status": "error",
-                          "error": f"Reference file not found: {args.ref}"}))
-        sys.exit(1)
-    with open(args.ref, "r", encoding="utf-8") as f:
-        ref_code = f.read()
-    try:
-        validate_ref(ref_code, args.ref)
-    except ValueError as e:
-        print(json.dumps({"status": "error", "error": str(e)}))
-        sys.exit(1)
-
+    # Read kernel file
     if not os.path.isfile(args.kernel):
         print(json.dumps({"status": "error",
                           "error": f"Kernel file not found: {args.kernel}"}))
@@ -354,20 +292,43 @@ def main():
     with open(args.kernel, "r", encoding="utf-8") as f:
         kernel_code = f.read()
 
-    # devices_list was resolved above.
+    # Read test file
+    if not os.path.isfile(args.test):
+        print(json.dumps({"status": "error",
+                          "error": f"Test file not found: {args.test}"}))
+        sys.exit(1)
+    with open(args.test, "r", encoding="utf-8") as f:
+        test_code = f.read()
+
+    # Read perf file
+    if not os.path.isfile(args.perf):
+        print(json.dumps({"status": "error",
+                          "error": f"Perf file not found: {args.perf}"}))
+        sys.exit(1)
+    with open(args.perf, "r", encoding="utf-8") as f:
+        perf_code = f.read()
+
+    # Preserve the user's test/perf filenames inside task_dir so the
+    # scripts' own `from <kernel_module> import ...` statements resolve.
+    test_filename = os.path.basename(args.test)
+    perf_filename = os.path.basename(args.perf)
+
     print(f"[scaffold] Creating task directory for {args.op_name}...", file=sys.stderr)
 
     task_dir = scaffold_task_dir(
-        ref_code=ref_code,
         kernel_code=kernel_code,
+        test_code=test_code,
+        perf_code=perf_code,
         op_name=args.op_name,
         devices=devices_list,
         arch=args.arch,
         max_rounds=args.max_rounds,
         eval_timeout=args.eval_timeout,
         output_dir=args.output_dir,
-        code_checker_enabled=args.code_checker,  # None -> config default
-        ref_source_path=args.ref,
+        test_filename=test_filename,
+        perf_filename=perf_filename,
+        code_checker_enabled=args.code_checker,
+        kernel_source_path=args.kernel,
         worker_url=args.worker_url,
     )
 
@@ -405,27 +366,22 @@ def main():
         #   4 = task NOT activatable (INFRA_FAIL — operator must intervene)
         # Anything else here is an unexpected baseline crash.
         if rc == 4:
-            # baseline_error_source lives in
-            # state.json via the task_summary facade. summary is None
-            # only when baseline never wrote state at all (older crashes
-            # before the first save_state), in which case err_source
-            # stays None and we fall through to the generic INFRA_FAIL
-            # hint below.
             from phase_machine import task_summary  # noqa: E402
             summary = task_summary(task_dir) or {}
             err_source = summary.get("baseline_error_source")
-            if err_source == "ref":
-                hint = ("The file passed via --ref is broken (import / "
-                        "forward / device-only bug). Fix the SOURCE file "
-                        "and re-run /autoresearch from scratch. The task "
-                        "directory is left for inspection but MUST NOT be "
-                        "activated — reference.py is not editable.")
+            if err_source == "infra":
+                hint = ("The test or perf script is broken (import / "
+                        "collection error, missing file, or internal "
+                        "crash). Fix the SOURCE script and re-run "
+                        "/autoresearch from scratch. The task directory "
+                        "is left for inspection but MUST NOT be activated "
+                        "— test/perf scripts are not editable.")
             else:
-                hint = ("INFRA_FAIL: no per-shape data — the seed kernel "
-                        "wasn't meaningfully exercised. Fix env (device / "
-                        "eval.timeout / worker / OOM) and re-run "
-                        "`/autoresearch --resume <task_dir>`. Phase stays "
-                        "at BASELINE.")
+                hint = ("INFRA_FAIL: no valid base timing — the perf "
+                        "script didn't produce a `cann: median=X.XXms` "
+                        "line. Fix env (device / eval.timeout / worker / "
+                        "OOM) and re-run `/autoresearch --resume "
+                        "<task_dir>`. Phase stays at BASELINE.")
             print(json.dumps({
                 "status": "error",
                 "task_dir": task_dir,
