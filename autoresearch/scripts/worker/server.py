@@ -279,9 +279,10 @@ async def run(
 ):
     """Verify + profile in one call (new workflow).
 
-    New workflow: the worker runs the user's test script (pytest) and
-    perf script in a single subprocess via `eval_kernel.py
-    --phases test,perf`. No `override_base_us` / `override_base_per_shape_us`
+    New workflow: the worker runs the user's test script (python
+    __main__) and perf script in a single subprocess via
+    `eval_kernel.py --phases test,perf`. No `override_base_us` /
+    `override_base_per_shape_us`
     form fields — the perf script measures both gen and base every round,
     so there is no sticky baseline to override.
 

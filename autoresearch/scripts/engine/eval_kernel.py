@@ -2,7 +2,8 @@
 
 The user supplies three files (written into the task_dir by scaffold):
   - kernel.py     — the editable kernel under optimization
-  - <test_file>   — a pytest-style correctness script
+  - <test_file>   — a python script whose `__main__` block runs all
+                    correctness cases and prints `... passed!` per case
   - <perf_file>   — a python script that prints timing lines to stdout
 
 This entrypoint runs the test and perf scripts as subprocesses, parses
@@ -12,11 +13,15 @@ in the same schema the old ref/kernel flow produced, so
 working with minimal changes.
 
 Test-script contract:
-  - Invoked as `pytest <test_file> --forked -k <smoke_filter>` (the
-    smoke filter is optional; pass `--test-filter ""` to disable).
+  - Invoked as `python <test_file>` (the script's `__main__` block is
+    responsible for running all cases and printing a summary line per
+    case; pass/fail is decided by exit code + stdout).
   - exit 0  ⇒ correctness = True
   - exit !=0 ⇒ correctness = False, error_source = "kernel"
-  - import / collection errors (pytest exit 2) are tagged
+  - The test script may print `... passed!` lines to indicate per-case
+    progress; we count those for `num_cases`. If the script raises an
+    exception during import/collection (e.g. SyntaxError, ModuleNotFound
+    before reaching `__main__`), the traceback in stderr is tagged
     error_source = "infra" (test script itself broken).
 
 Perf-script contract:
@@ -157,16 +162,30 @@ def _build_env(device_id: int) -> dict:
 def run_test_phase(task_dir: str, test_file: str, device_id: int,
                    timeout: int, test_filter: str | None,
                    env: dict) -> dict:
-    """Run pytest on the test_file. Return a verify-block dict.
+    """Run `python <test_file>` and decide correctness from exit code.
 
-    pytest exit codes (relevant):
-      0  — all tests passed
-      1  — some tests failed
-      2  — test execution was interrupted (collection error, import error,
-            bad CLI flag)
-      5  — no tests collected
-    We treat 0 as pass; 2 as infra (test script broken); everything else
-    as kernel failure (the kernel under test produced wrong output / crashed).
+    Contract for the test script's `__main__` block:
+      - Run all cases; print one line per case on success (commonly
+        `... passed!`); on failure, raise an exception (let it propagate
+        so the exit code is non-zero) or call `sys.exit(nonzero)`.
+
+    Exit-code semantics:
+      0   — script ran to completion without raising; correctness = True.
+            `num_cases` is best-effort counted from `... passed!` lines.
+      !=0 — script raised or sys.exit(nonzero). We distinguish:
+            * Infra failure (test script itself broken): the process
+              died BEFORE reaching `__main__` execution — i.e. stderr
+              contains a Python traceback whose topmost frame is at
+              module import / collection time (SyntaxError, ImportError,
+              NameError at module level). Tagged error_source="infra".
+            * Kernel failure (kernel produced wrong output): the
+              traceback's topmost frame is inside `__main__` or any
+              function the test calls (assertion, ValueError from
+              shape mismatch, etc.). Tagged error_source="kernel".
+            The heuristic is conservative: if we can't tell, we fall
+            back to "kernel" (the more actionable of the two for the
+            optimisation loop, since INFRA_FAIL parks the task at
+            BASELINE until the user fixes the script).
     """
     test_path = os.path.join(task_dir, test_file)
     if not os.path.isfile(test_path):
@@ -180,16 +199,19 @@ def run_test_phase(task_dir: str, test_file: str, device_id: int,
             "failed_indices": [],
         }
 
-    cmd = [sys.executable, "-m", "pytest", test_file, "--forked", "-q"]
-    if test_filter:
-        cmd.extend(["-k", test_filter])
+    # NOTE: `test_filter` is no longer used — pytest's `-k` filter has no
+    # equivalent in `python <file>` mode. Kept in the signature for
+    # call-site compatibility (eval_runner passes it through).
+    del test_filter
+
+    cmd = [sys.executable, test_file]
     rc, stdout, stderr = _run_subprocess(
         cmd, cwd=task_dir, env=env, timeout=timeout)
     combined = (stdout + "\n" + stderr).strip()
 
     if rc == 0:
-        # Count passed tests from the pytest summary line if present.
-        n = _count_pytest_cases(stdout, mode="passed")
+        # Count per-case "passed!" lines the script printed in __main__.
+        n = _count_passed_lines(stdout)
         return {
             "correctness": True,
             "error_source": None,
@@ -200,30 +222,18 @@ def run_test_phase(task_dir: str, test_file: str, device_id: int,
             "failed_indices": [],
             "log": combined[-2048:],
         }
-    if rc == 2:
-        # collection / import error → infra (test script itself broken)
-        return {
-            "correctness": False,
-            "error_source": "infra",
-            "error": f"pytest collection/import error (rc=2): "
-                     f"{_tail(combined, 400)}",
-            "num_cases": 0,
-            "per_case": [],
-            "diagnostics": [],
-            "failed_indices": [],
-            "log": combined[-2048:],
-        }
-    # rc == 1 (test failures) or rc == 5 (no tests) or other
-    failed = _count_pytest_cases(stdout, mode="failed")
-    total = _count_pytest_cases(stdout, mode="total")
+
+    # Non-zero exit — decide infra vs kernel by inspecting the traceback.
+    error_source = _classify_failure(stderr, stdout)
+    detail = _tail(combined, 400)
     return {
         "correctness": False,
-        "error_source": "kernel",
-        "error": f"pytest failed (rc={rc}): {_tail(combined, 400)}",
-        "num_cases": total,
+        "error_source": error_source,
+        "error": f"test script failed (rc={rc}): {detail}",
+        "num_cases": 0,
         "per_case": [],
         "diagnostics": [],
-        "failed_indices": list(range(failed)) if failed else [],
+        "failed_indices": [],
         "log": combined[-2048:],
     }
 
@@ -233,23 +243,68 @@ def _tail(s: str, n: int) -> str:
     return s[-n:] if len(s) > n else s
 
 
-_PASSED_RE = re.compile(r"(\d+)\s+passed", re.IGNORECASE)
-_FAILED_RE = re.compile(r"(\d+)\s+failed", re.IGNORECASE)
+# Lines like `golden test (D=512, ...) passed!` — the user's test scripts
+# print one per successful case in __main__.
+_PASSED_LINE_RE = re.compile(r"\bpassed!\s*$", re.IGNORECASE)
 
 
-def _count_pytest_cases(stdout: str, mode: str) -> int:
-    """Best-effort parse of pytest summary line."""
-    if mode == "passed":
-        m = _PASSED_RE.search(stdout)
-        return int(m.group(1)) if m else 0
-    if mode == "failed":
-        m = _FAILED_RE.search(stdout)
-        return int(m.group(1)) if m else 0
-    if mode == "total":
-        p = _count_pytest_cases(stdout, "passed")
-        f = _count_pytest_cases(stdout, "failed")
-        return p + f
-    return 0
+def _count_passed_lines(stdout: str) -> int:
+    """Count `... passed!` lines the test script printed in __main__."""
+    n = 0
+    for line in stdout.splitlines():
+        if _PASSED_LINE_RE.search(line.strip()):
+            n += 1
+    return n
+
+
+# Module-level / import-time failure signatures. If the traceback's
+# topmost (last) frame is at module scope (no function context, line
+# points at a top-level statement), we treat it as infra: the test
+# script itself failed to load, not a kernel correctness issue.
+_IMPORT_ERROR_PATTERNS = (
+    "SyntaxError",
+    "IndentationError",
+    "ImportError",
+    "ModuleNotFoundError",
+    "NameError:",         # usually a top-level typo
+    "AttributeError: module",
+)
+
+
+def _classify_failure(stderr: str, stdout: str) -> str:
+    """Return "infra" or "kernel" based on where the script failed.
+
+    Heuristics (checked in order):
+      1. stderr contains a Python traceback → look at the exception type
+         on the last `Traceback (most recent call last):` block.
+         - SyntaxError / ImportError / ModuleNotFoundError / top-level
+           NameError / AttributeError on a module → "infra"
+         - everything else (AssertionError, ValueError, RuntimeError
+           from kernel launch, etc.) → "kernel"
+      2. No traceback found (script called sys.exit(nonzero) without
+         raising) → "kernel" (the script deliberately signalled
+         failure; that's the test script's verdict on the kernel).
+    """
+    text = stderr if stderr else stdout
+    if "Traceback (most recent call last):" not in text:
+        return "kernel"
+    # Take the last line that looks like an exception type line
+    # (matches `ExcType: message` or `ExcType` at start of line).
+    exc_line = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Heuristic: exception lines usually start with a capitalised
+        # CamelCase identifier optionally followed by `:` and a message.
+        if re.match(r"^[A-Z][A-Za-z0-9_]*(Error|Exception|Warning)", stripped
+                    ) or ":" in stripped and re.match(
+                        r"^[A-Z][A-Za-z0-9_]*", stripped):
+            exc_line = stripped
+    for pat in _IMPORT_ERROR_PATTERNS:
+        if pat in exc_line:
+            return "infra"
+    return "kernel"
 
 
 def run_perf_phase(task_dir: str, perf_file: str, device_id: int,
@@ -314,15 +369,15 @@ def main():
                     help="kernel module name without .py (informational; the "
                          "test/perf scripts import the kernel themselves)")
     ap.add_argument("--test-file", required=True,
-                    help="pytest-style test script filename (with .py)")
+                    help="test script filename (with .py); invoked as "
+                         "`python <test_file>`. The script's __main__ block "
+                         "runs all cases and prints `... passed!` per case")
     ap.add_argument("--perf-file", required=True,
                     help="perf script filename (with .py); must print "
                          "`triton:  median=X.XXms` and `cann:    median=X.XXms`")
     ap.add_argument("--device-id", type=int, default=0)
     ap.add_argument("--phases", default="test,perf",
                     help="comma-separated subset of {test, perf}")
-    ap.add_argument("--test-filter", default="smoke",
-                    help="pytest -k expression (pass empty string to disable)")
     ap.add_argument("--perf-metric", default="median",
                     help="metric key to parse from perf stdout "
                          "(median|p20|p80|mean|avg|min|max)")
@@ -365,7 +420,7 @@ def main():
         try:
             verify_block = run_test_phase(
                 task_dir, args.test_file, args.device_id,
-                args.timeout, args.test_filter or None, env)
+                args.timeout, None, env)
             result["verify"] = verify_block
             if not verify_block.get("correctness"):
                 # Don't run perf if correctness already failed — saves

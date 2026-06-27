@@ -49,7 +49,7 @@ source ~/env.sh && python -c "import torch_npu, triton" && npu-smi info
 
 `workspace/<op>_kernel.py`：可编辑的种子 kernel，必须含 `@triton.jit` 并实际 launch（否则 [`engine/quick_check.py`](scripts/engine/quick_check.py) 拒绝）。
 
-`workspace/<op>_test.py`：pytest 风格的精度校验脚本，用 `@pytest.mark.parametrize` 列出一组 case，每个 case 内部调用 kernel 并与期望输出比对（通常比对一个 CANN/PyTorch baseline）。autoresearch 每轮 eval 通过 `pytest <test_file> --forked -q` 跑这个脚本；测试通过才算 correctness OK。
+`workspace/<op>_test.py`：python 精度校验脚本，由 `python <test_file>` 直接执行（不使用 pytest）。脚本须有一个 `if __name__ == "__main__":` 块，在其中按顺序跑所有 case：每个 case 通过后 `print("... passed!")`，失败则抛异常（让退出码非 0）或调用 `sys.exit(nonzero)`。autoresearch 每轮 eval 通过子进程跑这个脚本，依据退出码决定 correctness，并从 `passed!` 行数统计 num_cases。
 
 `workspace/<op>_perf.py`：性能脚本，**同一个脚本里同时测 triton kernel 与 baseline (CANN)**，并按下面协议打印到 stdout：
 
@@ -88,15 +88,19 @@ class ModelNew(nn.Module):
 
 ```python
 # workspace/relu_test.py
-import pytest, torch, torch.nn.functional as F
+import torch, torch.nn.functional as F
 from relu_kernel import ModelNew
 
-@pytest.mark.parametrize("shape", [(1024, 1024), (2048, 2048)])
-def test_relu(shape):
+def _check(shape):
     x = torch.randn(shape, dtype=torch.float16).npu()
     out = ModelNew()(x)
     ref = F.relu(x)
     assert torch.allclose(out, ref, rtol=1e-3, atol=1e-3)
+
+if __name__ == "__main__":
+    for shape in [(1024, 1024), (2048, 2048)]:
+        _check(shape)
+        print(f"relu shape={shape} passed!")
 ```
 
 ```python
@@ -408,7 +412,7 @@ A/B/C 均适用：
 | flag | 类型 | 必填？ | 默认 | 说明 |
 |---|---|---|---|---|
 | `--kernel` | 路径 | ✅ | — | 可编辑的种子 kernel 文件 |
-| `--test` | 路径 | ✅ | — | pytest 风格的精度校验脚本（详见 [§2](#2-命名契约)）|
+| `--test` | 路径 | ✅ | — | python 测试脚本，由 `python <test_file>` 直接执行，`__main__` 块跑所有 case 并打印 `... passed!`（详见 [§2](#2-命名契约)）|
 | `--perf` | 路径 | ✅ | — | 性能脚本，需同时测 triton 和 CANN base 并按 `triton: median=X.XXms` / `cann: median=X.XXms` 协议打印到 stdout |
 | `--op-name` | 字符串 | ✅ | — | op 名，决定 task_dir 前缀 |
 | `--devices` | 整数或逗号列表（`5` 或 `0,1,2,3`）| 二选一 | — | 本机 NPU 卡 id；如果给了 `--worker-url` 则可不填，由 worker 自带卡列表 |
@@ -479,7 +483,7 @@ A/B/C 均适用：
 | test 文件名 | 单跑任意；批跑严格 `<op>_test.py` |
 | perf 文件名 | 单跑任意；批跑严格 `<op>_perf.py` |
 | kernel 暴露 | 必须含 `@triton.jit` 且实际 launch；forward 不得用 `torch.*` / `F.*` / tensor 方法 / `@` 算子 / Python 循环完成计算（规则见 [`validate_triton_impl.py`](../skills/triton/kernel-verifier/scripts/validate_triton_impl.py)）。**不再强制 `class ModelNew`**——test/perf 自己 import kernel，结构由用户掌控 |
-| test 脚本契约 | pytest 风格（`@pytest.mark.parametrize` 或普通 `test_*` 函数均可）。autoresearch 用 `pytest <test_file> --forked -q` 调用；exit code 0 = 通过，2 = collection/import error（按 infra 失败归因），其它非零 = kernel 失败 |
+| test 脚本契约 | python 脚本，由 `python <test_file>` 直接执行（不使用 pytest）。脚本须含 `if __name__ == "__main__":` 块，在其中按顺序跑所有 case：每个 case 通过后 `print("... passed!")`，失败则抛异常或调用 `sys.exit(nonzero)`。autoresearch 按退出码判 correctness（0 = 通过），从 `passed!` 行数统计 num_cases；若脚本在 import 阶段就抛 SyntaxError/ImportError 等则按 infra 失败归因 |
 | perf 脚本契约 | stdout 必须含两行：`triton:  median=X.XXms`（gen 时延）与 `cann:    median=Y.YYms`（base 时延）。autoresearch 用正则 `^(triton\|cann)\s*:.*median=([0-9.]+)ms` 抓这两行。脚本内部自己管 warmup / repeats / 计时单位换算 |
 | 同目录数据文件 | kernel/test/perf 通常要从同目录读取 shape 列表 / 缓存（`.json`/`.pt`/`.npz`），scaffold 按这条规则决定哪些一起打包进 task_dir：去掉 kernel 文件名的 `.py` 后缀得到一个名字，**同名**的、或者以**它加下划线开头**的同目录 `.json`/`.pt`/`.npz` 会被拷进去；其余的 scaffold 看不见。<br/>例：kernel `sparse_flash_attention_triton.py` 可配 `sparse_flash_attention_triton.json`（同名）或 `sparse_flash_attention_triton_cases.json`（加下划线前缀）；没匹配上的数据文件不会进 task_dir，eval 时报 `FileNotFoundError`。 |
 | task.yaml 字段 | fixed schema（[loader.py](scripts/task_config/loader.py)）；拼写错误会被默认值覆盖。新 workflow 的 `eval` 块字段为 `test_file` 与 `perf_file`（替代旧的 `ref_file`） |
@@ -535,7 +539,7 @@ baseline.py / pipeline.py
  └─ task_config.run_eval(task_dir, config, device_id)
      └─ utils.eval_runner.local_eval                       # single-subprocess driver
           └─ Popen eval_kernel.py --phases test,perf
-                ├─ pytest <test_file> --forked -q          # 精度校验
+                ├─ python <test_file>                       # 精度校验（__main__ 跑 cases，按退出码判定）
                 └─ python <perf_file>                       # 测 triton + cann 时延，解析 stdout
 ```
 
@@ -550,11 +554,11 @@ baseline.py / pipeline.py
                                      utils.eval_runner.local_eval_async（同上）
 ```
 
-两条路径在 worker 内部共用同一份 `local_eval`，确保本地与远程行为不漂移。新 workflow 只起**一个**子进程（`eval_kernel.py --phases test,perf`）：子进程内先跑 pytest 精度校验，再跑 perf 脚本同时测 triton 与 CANN 时延，最后写一个 `.eval_result.json` sidecar。
+两条路径在 worker 内部共用同一份 `local_eval`，确保本地与远程行为不漂移。新 workflow 只起**一个**子进程（`eval_kernel.py --phases test,perf`）：子进程内先跑 `python <test_file>` 精度校验（依据退出码 0/非 0 判定），再跑 `python <perf_file>` 同时测 triton 与 CANN 时延，最后写一个 `.eval_result.json` sidecar。
 
 **Error source 归因**：
-- pytest exit code 2（collection/import error）或 perf 脚本崩溃 / 缺 `cann: median=` 行 → `error_source="infra"`，归类为 INFRA_FAIL（test/perf 脚本本身坏了，不归咎 kernel）
-- pytest 其它非零退出或 perf 脚本未产 triton 行 → `error_source="kernel"`，归类为 KERNEL_FAIL
+- test 脚本在 import 阶段就抛 SyntaxError/ImportError/ModuleNotFoundError 等模块级异常，或 perf 脚本崩溃 / 缺 `cann: median=` 行 → `error_source="infra"`，归类为 INFRA_FAIL（test/perf 脚本本身坏了，不归咎 kernel）
+- test 脚本在 `__main__` 中抛 AssertionError/ValueError/RuntimeError 等运行时异常，或 perf 脚本未产 triton 行 → `error_source="kernel"`，归类为 KERNEL_FAIL
 - 二者都过 → OK
 
 **无 sticky baseline**：新 workflow 每轮 perf 脚本都重新测 base，不再缓存复用 `baseline_metric`。`baseline_source` 写 `"base"`（替代旧 `"ref"`）。`baseline_anchor.py` 的 `sticky_override_from_progress` 恒返回 None，仅为兼容调用方保留。

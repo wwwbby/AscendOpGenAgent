@@ -28,7 +28,8 @@ import yaml
 # + helpers so the contract has a single owner.
 
 # New workflow (subprocess eval): no ref_file. The user supplies a
-# kernel (editable), a pytest-style test script, and a perf script that
+# kernel (editable), a python test script (run via `python <test_file>`,
+# __main__ runs all cases), and a perf script that
 # prints `triton:  median=X.XXms` and `cann:    median=X.XXms` lines.
 TEST_FILE_DEFAULT = "test_kernel.py"
 PERF_FILE_DEFAULT = "perf_kernel.py"
@@ -112,7 +113,7 @@ class TaskConfig:
 
     # Files
     editable_files: list = field(default_factory=list)
-    # New workflow: user-supplied test (pytest) + perf scripts replace the
+    # New workflow: user-supplied test (python __main__) + perf scripts replace the
     # old ref_file. test_file runs correctness checks; perf_file prints
     # `triton:  median=X.XXms` + `cann:    median=X.XXms` for gen/base timing.
     test_file: str = TEST_FILE_DEFAULT
@@ -127,8 +128,9 @@ class TaskConfig:
 
     # Eval params
     # Wall-clock budget for the eval subprocess (runs test + perf scripts).
-    # In the new workflow, a single subprocess runs both pytest and the
-    # perf script; num_cases is no longer probed (the test script manages
+    # In the new workflow, a single subprocess runs both the python test
+    # script and the perf script; num_cases is no longer probed (the test
+    # script manages
     # its own case matrix internally).
     eval_timeout: int = 600
 

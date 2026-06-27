@@ -7,7 +7,7 @@ needs the per-task artifacts:
   - task.yaml                  (always)
   - editable_files[*]          (kernel.py and any aux files in
                                 config.editable_files)
-  - test_file                  (pytest-style correctness script)
+  - test_file                  (python test script; run via `python <test_file>`)
   - perf_file                  (perf script printing triton/cann timing)
   - data_files[*]              (sibling files the kernel/test/perf
                                 scripts read at runtime — shape lists,

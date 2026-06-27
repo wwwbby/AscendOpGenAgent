@@ -2,8 +2,9 @@
 
 The new workflow runs a single subprocess: `eval_kernel.py` with
 `--phases test,perf`. Inside that subprocess, eval_kernel runs the
-user's pytest-style test script and the user's perf script, then writes
-a single `.eval_result.json` sidecar.
+user's test script (via `python <test_file>`, the script's __main__
+block runs all cases) and the user's perf script, then writes a single
+`.eval_result.json` sidecar.
 
 The old workflow split eval into two subprocesses (ref pass + kernel
 pass) so a kernel UB overflow couldn't kill ref timing. The new workflow

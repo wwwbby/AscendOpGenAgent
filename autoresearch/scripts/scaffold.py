@@ -5,14 +5,16 @@ Task directory scaffolder for Claude Code autoresearch (new workflow).
 Zero external dependency. Creates a self-contained task directory with:
   - task.yaml (config)
   - kernel.py (editable seed; written from the user's --kernel file)
-  - <test_file> (pytest-style correctness script; user-supplied)
+  - <test_file> (python correctness script; user-supplied)
   - <perf_file> (perf script printing triton/cann timing; user-supplied)
   - .ar_state/ (progress tracking)
   - .git/ (baseline commit)
 
 The new workflow drops the ref.py contract. Instead the user supplies
-three files: a kernel under optimization, a pytest test script, and a
-perf script that prints `triton:  median=X.XXms` + `cann:    median=X.XXms`.
+three files: a kernel under optimization, a python test script (run
+via `python <test_file>`, the script's __main__ block runs all cases
+and prints `... passed!` per case), and a perf script that prints
+`triton:  median=X.XXms` + `cann:    median=X.XXms`.
 
 Usage:
     python scripts/scaffold.py --kernel kernel.py --test test_op.py --perf perf_op.py --op-name my_op --devices <DEV>
@@ -207,7 +209,8 @@ def _make_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kernel", required=True,
                         help="Path to seed kernel file (editable)")
     parser.add_argument("--test", required=True,
-                        help="Path to pytest-style test script")
+                        help="Path to python test script (run via "
+                             "`python <test_file>`; __main__ runs cases)")
     parser.add_argument("--perf", required=True,
                         help="Path to perf script (prints triton/cann timing)")
     parser.add_argument("--op-name", default=None,

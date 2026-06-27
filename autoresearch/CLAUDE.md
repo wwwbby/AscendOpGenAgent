@@ -8,7 +8,8 @@ external deps beyond Python + PyYAML.
 
 ```bash
 # Drop sources into workspace/<op_name>_kernel.py (editable kernel),
-# workspace/<op_name>_test.py (pytest-style correctness test), and
+# workspace/<op_name>_test.py (python test script; run via `python <test_file>`,
+# the script's __main__ block runs all cases and prints `... passed!` per case), and
 # workspace/<op_name>_perf.py (perf script that prints both
 # `triton: median=X.XXms` and `cann:   median=X.XXms`), then start a
 # task. --devices is required.

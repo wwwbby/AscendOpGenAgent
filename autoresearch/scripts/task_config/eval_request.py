@@ -1,6 +1,7 @@
 """Build canonical eval requests before invoking the subprocess.
 
-New workflow: the user supplies test (pytest) + perf scripts. The perf
+New workflow: the user supplies a python test script (run via
+`python <test_file>`, __main__ runs all cases) + a perf script. The perf
 script measures both gen (triton kernel) and base (CANN reference) timing
 on every eval, so sticky baseline reuse is gone — there's no separate
 ref pass to skip. Case-count probing is gone too: the test/perf scripts
@@ -38,10 +39,10 @@ class EvalRequest:
 
 def effective_timeout(config: TaskConfig, num_cases: int) -> int:
     """config.eval_timeout is the budget for the eval subprocess. In the
-    new workflow a single subprocess runs both the test script (pytest)
-    and the perf script, so we no longer scale by num_cases — the test
-    script manages its own case matrix and the wall-clock cost is bounded
-    by the script itself, not by autoresearch's case count."""
+    new workflow a single subprocess runs both the test script (python
+    __main__) and the perf script, so we no longer scale by num_cases —
+    the test script manages its own case matrix and the wall-clock cost
+    is bounded by the script itself, not by autoresearch's case count."""
     return int(config.eval_timeout)
 
 

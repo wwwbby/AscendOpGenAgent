@@ -110,9 +110,10 @@ def assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
     )
 
     # Outcome — new workflow (subprocess eval):
-    #   error_source == "infra"  → test/perf script itself broken (pytest
-    #                              collection error, missing file, internal
-    #                              eval crash, worker-side infra). INFRA_FAIL.
+    #   error_source == "infra"  → test/perf script itself broken (python
+    #                              import/ SyntaxError before __main__,
+    #                              missing file, internal eval crash,
+    #                              worker-side infra). INFRA_FAIL.
     #   verify_ok and gen_ok     → kernel passed test + produced timing. OK.
     #   verify_ok == False       → kernel correctness failure (test failed
     #                              or perf crashed). KERNEL_FAIL.
@@ -237,10 +238,11 @@ def assemble_eval_result(verify_resp: dict, profile_resp: dict) -> EvalResult:
     if outcome == EvalOutcome.OK:
         error = None
     elif error_source == "infra":
-        # Test/perf script itself broken (pytest collection error, missing
-        # file, internal eval crash, worker-side infra). The detail lives
-        # in verify_json.error (set by eval_kernel.run_test_phase) or in
-        # verify_log (set by worker._error_response).
+        # Test/perf script itself broken (python import error before
+        # __main__, missing file, internal eval crash, worker-side infra).
+        # The detail lives in verify_json.error (set by
+        # eval_kernel.run_test_phase) or in verify_log (set by
+        # worker._error_response).
         top = verify_json.get("error") if verify_json else None
         error = (f"infra failure: {top or verify_log.strip() or '(no detail)'}")
     elif not verify_ok:

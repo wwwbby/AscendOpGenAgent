@@ -30,9 +30,11 @@ follow the latest `[AR Phase: ...]` message and never stop between phases.
   the operator's concern, not yours.
 
   Convention: source files live in `workspace/<op_name>_kernel.py`
-  (editable kernel), `workspace/<op_name>_test.py` (pytest-style
-  correctness test), and `workspace/<op_name>_perf.py` (perf script
-  that prints both `triton: median=X.XXms` and `cann: median=X.XXms`).
+  (editable kernel), `workspace/<op_name>_test.py` (python test script;
+  run via `python <test_file>`, the script's __main__ block runs all
+  cases and prints `... passed!` per case), and
+  `workspace/<op_name>_perf.py` (perf script that prints both
+  `triton: median=X.XXms` and `cann: median=X.XXms`).
 
 `--output-dir` defaults to `ar_tasks`.
 
@@ -54,7 +56,7 @@ Returns a single-line JSON dispatch record:
 {
   "mode": "scaffold|resume|ask",
   "command": "python ... (verbatim, ready to exec)" or null,
-  "values": {ref, kernel, op_name, devices, max_rounds, ...},
+  "values": {kernel, test, perf, op_name, devices, max_rounds, ...},
   "missing": [...]
 }
 ```
@@ -74,12 +76,13 @@ Scaffold's `--run-baseline` runs the seed eval at scaffold time. The
 outcome decides the next activation's starting phase (all written to
 `state.json`, single source of truth):
 
-- **OK / KERNEL_FAIL** (ref baseline measured) → phase = `PLAN`; the
+- **OK / KERNEL_FAIL** (perf base measured) → phase = `PLAN`; the
   next activation drops into PLAN. KERNEL_FAIL means the first plan
   items must rewrite the broken seed.
-- **INFRA_FAIL / no valid ref baseline** → phase stays at `BASELINE`
-  with no committed progress (baseline pending). Fix env / ref /
-  worker, then `/autoresearch --resume <task_dir>` re-runs baseline.
+- **INFRA_FAIL / no valid perf base** → phase stays at `BASELINE`
+  with no committed progress (baseline pending). Fix env / test /
+  perf / worker, then `/autoresearch --resume <task_dir>` re-runs
+  baseline.
 
 ## Step 3 — Activate
 
